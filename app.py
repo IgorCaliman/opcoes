@@ -21,7 +21,7 @@ WATCHLIST = [
     # Primeira lista
     "BOVA11", "PETR4", "SMAL11", "BBAS3", "VALE3", "BBDC4", "ITUB4", "CYRE3",
     "MGLU3", "B3SA3", "PRIO3", "ABEV3", "BPAC11", "CMIN3", "WEGE3", "CSNA3",
-    "SUZB3", "PETR3", "EMBJ3", "IBOV11", "ITSA4", "CEAB3", "BEEF3", "LREN3",
+    "SUZB3", "PETR3", "EMBJ3", "ITSA4", "CEAB3", "BEEF3", "LREN3",
     "VAMO3",
     # Segunda lista
     "BBSE3", "TOTS3", "USIM5", "RENT3", "AXIA3", "COGN3", "MBRF3", "MRVE3",
