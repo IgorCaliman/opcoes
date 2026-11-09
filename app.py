@@ -179,6 +179,23 @@ def dialogo_adicionar():
             st.rerun()
 
 
+@st.dialog("Fechar operação")
+def dialogo_fechar():
+    if OPERACOES.empty:
+        st.caption("Nenhuma operação aberta.")
+        return
+    opcoes = [f"{r.ativo} — {r.tipo}" for r in OPERACOES.itertuples()]
+    escolhidas = st.multiselect("Operações encerradas", opcoes, placeholder="Escolha uma ou mais")
+    if st.button("Excluir", type="primary", disabled=not escolhidas):
+        itens = [tuple(o.split(" — ")) for o in escolhidas]
+        try:
+            ops_mod.remover_operacoes(itens)
+        except ValueError as e:
+            st.error(str(e))
+        else:
+            st.rerun()
+
+
 def estilo_ideias(tab: pd.DataFrame):
     mapa = {
         "Último": brl, "HiLo (stop ref.)": brl,
@@ -330,8 +347,11 @@ with aba_consolidado:
         st.caption("Sem sinal ou sem dados: " + ", ".join(sem_sinal))
 
 with aba_operacoes:
-    if st.button("Adicionar operação", type="primary"):
+    c1, c2, _ = st.columns([1, 1, 4])
+    if c1.button("Adicionar operação", type="primary"):
         dialogo_adicionar()
+    if c2.button("Fechar operação", disabled=OPERACOES.empty):
+        dialogo_fechar()
 
     if OPERACOES.empty:
         st.caption("Nenhuma operação aberta.")
