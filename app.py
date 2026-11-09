@@ -364,9 +364,10 @@ with st.sidebar:
         st.warning("Sem dados: " + ", ".join(SEM_DADOS))
 
 (aba_ativo, aba_consolidado, aba_operacoes, aba_mercado, aba_watch,
- aba_direcional, aba_travas, aba_cadeia, aba_pozinhos) = st.tabs([
+ aba_direcional, aba_travas, aba_cadeia, aba_pozinhos, aba_hot) = st.tabs([
     "Ativo por ativo", "Consolidado", "Operações abertas", "Mercado e exposição", "Acompanhamento",
     "Acompanhamento - direcional", "Acompanhamento - travas", "Cadeia de opções", "Pozinhos",
+    "Pozinhos - hot picks",
 ])
 
 with aba_ativo:
@@ -700,21 +701,14 @@ with aba_cadeia:
 
 
 # ---- Pozinhos -------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="Calculando pozinhos...")
+@st.cache_data(ttl=3600, show_spinner="Calculando pozinhos (simulando a regra de saída no histórico)...")
 def _listar_pozinhos(hoje: date, versao: str, selic: float) -> tuple[date | None, pd.DataFrame]:
     resultado = pregao_opcoes(hoje)
     if resultado is None:
         return None, pd.DataFrame()
     pregao, cotahist = resultado
-    historicos, analises = {}, {}
-    for an in _analisar_universo(tuple(UNIVERSO), versao):
-        analises[an["ativo"]] = an
-    for t in UNIVERSO:
-        try:
-            historicos[t] = _carregar(t, versao)
-        except Exception:
-            pass
-    return pregao, pz.listar(cotahist, pregao, selic, historicos, analises)
+    analises = {an["ativo"]: an for an in _analisar_universo(tuple(UNIVERSO), versao)}
+    return pregao, pz.listar(cotahist, pregao, selic, _historicos(versao), analises)
 
 
 def cor_retorno(v: float) -> str:
@@ -729,25 +723,69 @@ def cor_sigma(v: float) -> str:
     return VERDE if v <= 1 else AMARELO if v <= 2 else VERMELHO
 
 
-COLS_POZ = {
+def cor_nota(v: str) -> str:
+    return {"Quente": VERDE, "Morno": AMARELO, "Frio": VERMELHO}.get(v, "")
+
+
+def pct_txt(v: float, casas: int = 0, sinal: bool = False) -> str:
+    if pd.isna(v):
+        return "—"
+    fmt = f"{{:{'+' if sinal else ''}.{casas}f}}%"
+    return fmt.format(v * 100).replace(".", ",")
+
+
+def num_txt(v: float, casas: int = 2) -> str:
+    return "—" if pd.isna(v) else f"{v:.{casas}f}".replace(".", ",")
+
+
+ALVO_ROTULOS = {f"+{a * 100:.0f}%": a for a in pz.ALVOS_SAIDA}
+EV80, PR80 = pz.col_ev(pz.ALVO_PADRAO), pz.col_prob(pz.ALVO_PADRAO)
+
+COLS_POZ_RESUMO = {
     "opcao": "Opção", "ativo": "Ativo", "tipo": "Tipo", "vencimento": "Venc.", "du": "d.u.",
     "strike": "Strike", "dist": "Dist.", "premio": "Prêmio", "bid": "Bid", "negocios": "Negócios",
-    "sinal": "Sinal HiLo", "mercado": "Mercado", "forca": "Força", "sigma_be": "σ até breakeven", "prob_bs": "Prob. B&S",
+    "sigma_be": "σ até breakeven", PR80: "Chance +80% (hist.)", EV80: "EV saída +80%", "mercado": "Mercado",
+}
+COLS_POZ_EXTRA = {
+    "sinal": "Sinal HiLo", "forca": "Força", "spread": "Spread", "prob_bs": "Prob. B&S",
     "prob_venc": "Prob. venc. (hist.)", "prob_toque": "Prob. toque (hist.)",
-    "ret_esperado": "Ret. esperado (hist.)", "mult_2s": "Mult. em 2σ",
+    "ret_esperado": "Ret. no venc. (hist.)", "mult_2s": "Mult. em 2σ",
 }
 ORDENS_POZ = {
-    "Retorno esperado (hist.)": ("ret_esperado", False), "Prob. de toque (hist.)": ("prob_toque", False),
-    "Mult. em 2σ": ("mult_2s", False), "Menos σ até o breakeven": ("sigma_be", True),
-    "Mais negociados": ("negocios", False),
+    "EV com saída em +80%": (EV80, False), "Chance de bater +80%": (PR80, False),
+    "Retorno no vencimento (hist.)": ("ret_esperado", False), "Mult. em 2σ": ("mult_2s", False),
+    "Menos σ até o breakeven": ("sigma_be", True), "Mais negociados": ("negocios", False),
 }
+FORMATOS_POZ = {
+    "Venc.": lambda v: f"{v:%d/%m/%y}", "Strike": ou_traco(lambda v: num_txt(v)),
+    "Dist.": ou_traco(pct_sinal), "Prêmio": ou_traco(lambda v: num_txt(v)), "Bid": ou_traco(lambda v: num_txt(v)),
+    "Força": ou_traco(lambda v: f"{int(v):+d}"), "σ até breakeven": ou_traco(lambda v: num_txt(v, 1) + "σ"),
+    "Spread": lambda v: pct_txt(v), "Prob. B&S": lambda v: pct_txt(v, 1), "Prob. venc. (hist.)": lambda v: pct_txt(v, 1),
+    "Prob. toque (hist.)": lambda v: pct_txt(v, 1), "Chance +80% (hist.)": lambda v: pct_txt(v, 1),
+    "EV saída +80%": lambda v: pct_txt(v, 0, True), "Ret. no venc. (hist.)": lambda v: pct_txt(v, 0, True),
+    "Mult. em 2σ": ou_traco(lambda v: num_txt(v, 1) + "x"),
+}
+
+
+def estilo_pozinhos(tab: pd.DataFrame):
+    est = tab.style.format({c: f for c, f in FORMATOS_POZ.items() if c in tab.columns})
+    for col, fn in (("Tipo", cor_estrutura), ("Sinal HiLo", cor_sinal), ("Mercado", cor_mercado),
+                    ("σ até breakeven", cor_sigma), ("EV saída +80%", cor_retorno),
+                    ("Ret. no venc. (hist.)", cor_retorno), ("Nota", cor_nota), ("EV com saída", cor_retorno)):
+        if col in tab.columns:
+            est = est.map(fn, subset=[col])
+    return est
+
+
+def a_favor_regime(tipo: str) -> str:
+    return mercado.mercado_a_favor(tipo, REGIME)
+
 
 with aba_pozinhos:
     st.caption(
         "Pozinhos = opções fora do dinheiro com prêmio de até R$ 0,15 (ask do fechamento, ou o último negócio), "
         "nos ativos da lista principal e do acompanhamento. Dados de fim de dia do COTAHIST da B3. "
-        "Probabilidades e retorno 'hist.' vêm do histórico ajustado do próprio ativo, em janelas com o mesmo "
-        "prazo da opção; não são previsão."
+        "Colunas 'hist.' vêm do histórico ajustado do próprio ativo, em janelas com o mesmo prazo da opção."
     )
     pregao_poz, poz = _listar_pozinhos(date.today(), VERSAO, selic_atual())
     if pregao_poz is None:
@@ -760,11 +798,14 @@ with aba_pozinhos:
         faixas = f2.multiselect("Faixa de prêmio", list(pz.FAIXAS), default=list(pz.FAIXAS), key="poz_faixa")
         du_max = f3.slider("Prazo máximo (dias úteis)", 1, pz.DU_MAX, 30, key="poz_du")
         ordem = f4.selectbox("Ordenar por", list(ORDENS_POZ), key="poz_ordem")
-        g1, g2, g3, _ = st.columns([1, 1, 1, 1])
+        g1, g2, g3, g4, g5 = st.columns(5)
         so_alinhados = g1.checkbox("Só alinhados com o HiLo", value=True, key="poz_alinhado")
-        com_bid = g2.checkbox("Exige oferta de compra", value=False, key="poz_bid",
+        sem_semanais = g2.checkbox("Sem vencimentos semanais", value=True, key="poz_semanal",
+                                   help="Tira as séries que não vencem na 3ª sexta do mês (códigos com W1, W2...).")
+        com_bid = g3.checkbox("Exige oferta de compra", value=True, key="poz_bid",
                               help="Só opções com bid no fechamento: dá para vender antes do vencimento.")
-        com_neg = g3.checkbox("Só com negócio no pregão", value=False, key="poz_neg")
+        com_neg = g4.checkbox("Só com negócio no pregão", value=True, key="poz_neg")
+        detalhado = g5.toggle("Todas as colunas", value=False, key="poz_detalhado")
 
         filtro = poz["tipo"].isin(tipos_poz) & (poz["du"] <= du_max)
         if faixas:
@@ -775,44 +816,34 @@ with aba_pozinhos:
             filtro &= na_faixa
         if so_alinhados:
             filtro &= poz["alinhado"]
+        if sem_semanais:
+            filtro &= ~poz["semanal"]
         if com_bid:
             filtro &= poz["bid"].notna()
         if com_neg:
             filtro &= poz["negocios"] > 0
         sel = poz[filtro].copy()
-        sel["mercado"] = sel["tipo"].map(lambda t: mercado.mercado_a_favor(t, REGIME))
+        sel["mercado"] = sel["tipo"].map(a_favor_regime)
         col, asc = ORDENS_POZ[ordem]
         sel = sel.sort_values(col, ascending=asc, na_position="last")
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Pregão", f"{pregao_poz:%d/%m/%Y}")
         m2.metric("Pozinhos no filtro", f"{len(sel)} de {len(poz)}")
-        m3.metric("Com retorno hist. positivo", int((sel["ret_esperado"] > 0).sum()))
-        m4.metric("Com bid (saída possível)", int(sel["bid"].notna().sum()))
+        m3.metric("EV positivo saindo em +80%", int((sel[EV80] > 0).sum()))
+        m4.metric("Chance média de bater +80%", pct_txt(sel[PR80].mean(), 1))
 
         if sel.empty:
             st.caption("Nenhum pozinho com esses filtros.")
         else:
-            tab = sel[list(COLS_POZ)].rename(columns=COLS_POZ)
-            pct1 = ou_traco(lambda v: f"{v * 100:.1f}%".replace(".", ","))
-            num2 = ou_traco(lambda v: f"{v:.2f}".replace(".", ","))
-            estilo = (
-                tab.style
-                .map(cor_estrutura, subset=["Tipo"])
-                .map(cor_sinal, subset=["Sinal HiLo"])
-                .map(cor_mercado, subset=["Mercado"])
-                .map(cor_retorno, subset=["Ret. esperado (hist.)"])
-                .map(cor_sigma, subset=["σ até breakeven"])
-                .format({
-                    "Venc.": lambda v: f"{v:%d/%m/%y}", "Strike": num2, "Dist.": ou_traco(pct_sinal),
-                    "Prêmio": num2, "Bid": num2, "Força": ou_traco(lambda v: f"{int(v):+d}"),
-                    "σ até breakeven": ou_traco(lambda v: f"{v:.1f}σ".replace(".", ",")),
-                    "Prob. B&S": pct1, "Prob. venc. (hist.)": pct1, "Prob. toque (hist.)": pct1,
-                    "Ret. esperado (hist.)": ou_traco(lambda v: f"{v * 100:+.0f}%"),
-                    "Mult. em 2σ": ou_traco(lambda v: f"{v:.1f}x".replace(".", ",")),
-                })
+            cols = {**COLS_POZ_RESUMO, **(COLS_POZ_EXTRA if detalhado else {})}
+            tab = sel[list(cols)].rename(columns=cols)
+            st.dataframe(estilo_pozinhos(tab), hide_index=True, width="stretch", height=min(40 + 35 * len(tab), 600))
+            st.caption(
+                "Chance +80% = em quantas janelas históricas a opção chegou a valer o prêmio + 80% em algum "
+                "fechamento antes do vencimento. EV saída +80% = retorno médio por real investido zerando nesse "
+                "alvo (ou levando ao vencimento se não bater). Detalhes em 'Como ler'."
             )
-            st.dataframe(estilo, hide_index=True, width="stretch", height=min(40 + 35 * len(tab), 600))
 
             st.markdown("**Detalhe do pozinho**")
             escolha = st.selectbox("Opção", sel["opcao"].tolist(), key="poz_detalhe")
@@ -835,17 +866,119 @@ with aba_pozinhos:
             st.markdown(
                 "- **σ até breakeven**: quanto o ativo precisa andar até o vencimento, em desvios-padrão da vol "
                 "EWMA. Até 1σ (verde) é movimento comum; acima de 2σ (vermelho) é aposta de cauda.\n"
-                "- **Prob. B&S**: probabilidade, embutida no preço, de vencer além do breakeven.\n"
-                "- **Prob. venc. / toque (hist.)**: fração das janelas históricas de mesmo prazo em que o ativo "
-                "terminou além do breakeven / chegou a tocá-lo em algum momento. O toque importa porque você "
-                "costuma zerar antes do vencimento.\n"
-                "- **Ret. esperado (hist.)**: média do payoff no vencimento, aplicando cada retorno histórico ao "
-                "preço de hoje, dividida pelo prêmio, menos 1. Positivo = no passado, o bilhete pagou mais do que "
-                "custou. As janelas se sobrepõem e o histórico é de ~3 anos: trate como triagem, não como edge "
-                "garantido.\n"
-                "- **Mult. em 2σ**: quantas vezes o prêmio a opção vale no vencimento se o ativo andar 2σ a favor.\n"
-                "- **Bid vazio**: sem comprador no fechamento. Em pozinho isso é comum e significa que a saída "
-                "antecipada pode não existir."
+                "- **Chance +80% (hist.)**: o caminho de cada janela histórica de mesmo prazo é aplicado ao preço de "
+                "hoje e a opção é reavaliada todo dia por Black-Scholes; conta quantas vezes ela chegou a valer o "
+                "prêmio + 80%.\n"
+                "- **EV saída +80%**: retorno médio seguindo a regra (zera no alvo, senão leva ao vencimento). É a "
+                "métrica que conversa com o jeito que você opera.\n"
+                "- **Ret. no venc. (hist.)**: o mesmo, mas segurando até o vencimento. Quase sempre negativo em "
+                "pozinho: é por isso que a saída no alvo importa.\n"
+                "- **Prob. B&S / venc. / toque**: chance embutida no preço vs. frequência histórica de terminar ou "
+                "tocar além do breakeven.\n"
+                "- Limitações: saída avaliada no fechamento, sem custo de spread na venda, histórico de ~3 anos com "
+                "janelas sobrepostas. Use como triagem."
+            )
+
+
+# ---- Pozinhos - hot picks -----------------------------------------------------------------
+def card_pick(o: pd.Series, alvo: float) -> None:
+    with st.container(border=True):
+        cor = COR_HILO_ALTA if o["tipo"] == "Call" else COR_HILO_BAIXA
+        nota_cor = {"Quente": "#00c853", "Morno": "#facc15", "Frio": "#ff1744"}.get(o["nota"], "#9e9e9e")
+        st.markdown(
+            f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+            f"<span style='font-size:1.15rem;font-weight:700'>{o['opcao']}</span>"
+            f"<span style='background:{nota_cor};color:#000;padding:2px 8px;border-radius:6px;"
+            f"font-weight:600;font-size:0.8rem'>{o['nota']}</span></div>"
+            f"<div style='color:{cor};font-weight:600'>{o['ativo']} · {o['tipo']}</div>",
+            unsafe_allow_html=True,
+        )
+        lado = "subir" if o["tipo"] == "Call" else "cair"
+        st.caption(
+            f"Strike {num_txt(o['strike'])} · venc. {o['vencimento']:%d/%m} ({o['du']} d.u.) · "
+            f"prêmio R\\$ {num_txt(o['premio'])} (bid {num_txt(o['bid'])}) · {o['negocios']} negócios"
+        )
+        k1, k2, k3 = st.columns(3)
+        k1.metric(f"Chance de +{alvo * 100:.0f}%", pct_txt(o["prob_alvo"]))
+        k2.metric("EV com saída", pct_txt(o["ev"], 0, True))
+        k3.metric("σ até breakeven", num_txt(o["sigma_be"], 1) + "σ")
+        st.caption(
+            f"Precisa {lado} {pct_txt(abs(o['dist_be']), 1)} até o vencimento para pagar o prêmio. "
+            f"HiLo {'a favor' if o['alinhado'] else 'contra'} · mercado {o['mercado'].lower()} · "
+            f"no vencimento (sem saída) o histórico dá {pct_txt(o['ret_esperado'], 0, True)}."
+        )
+
+
+with aba_hot:
+    st.caption(
+        "Os pozinhos com melhor relação entre chance de bater o seu alvo de saída e o ganho quando bate, "
+        "pelo histórico do próprio ativo. Só entram opções negociáveis: com bid, com negócio no pregão, spread de "
+        f"até {pz.SPREAD_MAX * 100:.0f}% do meio e pelo menos {pz.PROB_MIN * 100:.0f}% de chance de bater o alvo."
+    )
+    pregao_hot, poz_hot = _listar_pozinhos(date.today(), VERSAO, selic_atual())
+    if pregao_hot is None:
+        st.error("Não foi possível baixar o COTAHIST da B3 nos últimos pregões. Tente de novo mais tarde.")
+    elif poz_hot.empty:
+        st.caption("Nenhum pozinho encontrado nos ativos do universo.")
+    else:
+        h1, h2, h3, h4 = st.columns([1, 1, 2, 1])
+        tipos_hot = h1.multiselect("Tipo", ["Call", "Put"], default=["Call", "Put"], key="hot_tipo")
+        alvo_rot = h2.selectbox("Zerar com", list(ALVO_ROTULOS), index=list(ALVO_ROTULOS.values()).index(pz.ALVO_PADRAO),
+                                key="hot_alvo")
+        du_hot = h3.slider("Prazo máximo (dias úteis)", 1, pz.DU_MAX, 30, key="hot_du")
+        n_picks = h4.number_input("Quantos picks", 2, 20, 6, step=2, key="hot_n")
+        i1, i2, i3 = st.columns(3)
+        sem_sem_hot = i1.checkbox("Sem vencimentos semanais", value=True, key="hot_semanal")
+        alinh_hot = i2.checkbox("Só alinhados com o HiLo", value=True, key="hot_alinhado")
+        merc_hot = i3.checkbox("Excluir os contra o regime de mercado", value=False, key="hot_mercado")
+        alvo = ALVO_ROTULOS[alvo_rot]
+
+        picks = pz.hot_picks(poz_hot, alvo, tuple(tipos_hot), du_hot, sem_sem_hot, alinh_hot, a_favor_regime, merc_hot)
+        positivos = picks[picks["ev"] > 0]
+        st.markdown(f"Pregão de **{pregao_hot:%d/%m/%Y}** · regime **{REGIME['rotulo']}** · "
+                    f"{len(positivos)} de {len(picks)} pozinhos negociáveis com EV positivo zerando em {alvo_rot}.")
+
+        if picks.empty:
+            st.info("Nenhum pozinho negociável com esses filtros.")
+        else:
+            if positivos.empty:
+                st.warning("Nenhum pozinho com EV positivo hoje. Abaixo, os menos piores: só se tiver convicção própria.")
+                mostrar = picks.head(int(n_picks))
+            else:
+                mostrar = positivos.head(int(n_picks))
+            colunas = st.columns(2)
+            for i, (_, o) in enumerate(mostrar.iterrows()):
+                with colunas[i % 2]:
+                    card_pick(o, alvo)
+
+            with st.expander(f"Ranking completo ({len(picks)} pozinhos negociáveis)"):
+                rk = picks.rename(columns={
+                    "nota": "Nota", "opcao": "Opção", "ativo": "Ativo", "tipo": "Tipo", "vencimento": "Venc.",
+                    "du": "d.u.", "strike": "Strike", "premio": "Prêmio", "bid": "Bid", "negocios": "Negócios",
+                    "sigma_be": "σ até breakeven", "prob_alvo": "Chance do alvo", "ev": "EV com saída",
+                    "mercado": "Mercado",
+                })[["Nota", "Opção", "Ativo", "Tipo", "Venc.", "d.u.", "Strike", "Prêmio", "Bid", "Negócios",
+                    "σ até breakeven", "Chance do alvo", "EV com saída", "Mercado"]]
+                st.dataframe(
+                    estilo_pozinhos(rk).format({"Chance do alvo": lambda v: pct_txt(v, 1),
+                                                "EV com saída": lambda v: pct_txt(v, 0, True)}),
+                    hide_index=True, width="stretch", height=min(40 + 35 * len(rk), 600),
+                )
+
+        with st.expander("Como os hot picks são escolhidos"):
+            st.markdown(
+                "1. **Universo**: pozinhos da aba ao lado, só os negociáveis (bid, negócio no pregão, spread "
+                "aceitável), sem semanais e alinhados ao HiLo, se marcado.\n"
+                "2. **Simulação da sua regra**: para cada janela histórica com o mesmo prazo da opção, o ativo "
+                "refaz o caminho daquele período a partir do preço de hoje, e a opção é reavaliada todo dia "
+                "(Black-Scholes, vol = média entre a implícita e a EWMA do ativo). Se ela chega a valer o prêmio + "
+                "alvo, a operação é zerada ali; se não, vale o que valer no vencimento.\n"
+                "3. **EV com saída** = média do resultado de todas as janelas, por real investido. É a nota "
+                "principal: junta a chance de chegar lá e o quanto se ganha.\n"
+                "4. **Nota**: Quente = EV ≥ +15% e chance ≥ 20%; Morno = EV positivo; Frio = EV negativo.\n\n"
+                "O histórico é de ~3 anos, as janelas se sobrepõem e a saída é avaliada no fechamento sem custo de "
+                "spread. Um EV de +10% no histórico não é garantia de nada: é o melhor ponto de partida para a "
+                "sua análise, não o fim dela."
             )
 
 

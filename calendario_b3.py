@@ -72,3 +72,21 @@ def pregoes_anteriores(ref, n: int) -> list[date]:
             saida.append(d)
         d -= timedelta(days=1)
     return saida
+
+
+@lru_cache(maxsize=None)
+def vencimento_mensal(ano: int, mes: int) -> date:
+    """Vencimento mensal de opções sobre ações: 3ª sexta-feira do mês; se não houver pregão,
+    o pregão anterior (ex.: 20/11/2026 é feriado, então o vencimento é 19/11)."""
+    d = date(ano, mes, 1)
+    d += timedelta(days=(4 - d.weekday()) % 7)  # 1ª sexta
+    d += timedelta(days=14)                      # 3ª sexta
+    while not e_pregao(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def e_semanal(vencimento) -> bool:
+    """True se o vencimento não é o mensal (opção semanal, códigos terminados em W1, W2...)."""
+    v = _data(vencimento)
+    return v != vencimento_mensal(v.year, v.month)

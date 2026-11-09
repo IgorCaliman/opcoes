@@ -141,6 +141,7 @@ def cadeia(df: pd.DataFrame, ativo: str, pregao: date, selic: float, vol_ref: fl
         return pd.DataFrame()
 
     op["du"] = [cal.dias_uteis(pregao, v) for v in op["vencimento"]]
+    op["semanal"] = [cal.e_semanal(v) for v in op["vencimento"]]
     op["T"] = op["du"] / bs.DIAS_ANO
     op["spot"] = spot
     op["dist"] = op["strike"] / spot - 1
@@ -160,7 +161,7 @@ def cadeia(df: pd.DataFrame, ativo: str, pregao: date, selic: float, vol_ref: fl
     op["tipo"] = op["mercado"]
     colunas = ["codneg", "tipo", "vencimento", "du", "strike", "dist", "moneyness", "spot", "bid", "ask",
                "meio", "ultimo", "minima", "maxima", "negocios", "volume", "spread", "iv", "delta",
-               "gama", "theta", "vega", "prob_exercicio", "especi", "indopc"]
+               "gama", "theta", "vega", "prob_exercicio", "semanal", "especi", "indopc"]
     return op[colunas].rename(columns={"codneg": "opcao"}).sort_values(["vencimento", "tipo", "strike"])
 
 

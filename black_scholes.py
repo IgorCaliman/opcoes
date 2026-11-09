@@ -19,12 +19,21 @@ DIAS_ANO = 252
 SELIC_PADRAO = 0.15  # usada só se a API do Banco Central não responder
 _URL_SELIC = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.432/dados/ultimos/1?formato=json"
 
-_erf = np.vectorize(math.erf, otypes=[float])
+def _erf(x: np.ndarray) -> np.ndarray:
+    """Função erro, aproximação de Abramowitz-Stegun 7.1.26 (erro máximo ~1,5e-7), em numpy puro."""
+    sinal = np.sign(x)
+    x = np.abs(x)
+    t = 1.0 / (1.0 + 0.3275911 * x)
+    y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+               + 0.254829592) * t * np.exp(-x * x)
+    return sinal * y
 
 
 def N(x):
     """Distribuição normal acumulada."""
-    return 0.5 * (1.0 + _erf(np.asarray(x, dtype=float) / math.sqrt(2.0)))
+    x = np.asarray(x, dtype=float)
+    with np.errstate(invalid="ignore"):
+        return 0.5 * (1.0 + _erf(x / math.sqrt(2.0)))
 
 
 def n(x):
