@@ -1,8 +1,10 @@
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+import alvos
 import cotacoes
 import estrategias
 import operacoes as ops_mod
@@ -66,6 +68,15 @@ def analisar_universo(tickers: tuple) -> list[dict]:
         except Exception:
             pass
     return saida
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def alvos_ativo(ticker: str, direcao: int) -> dict:
+    """Alvo (Bollinger), stop curto (ATR) e histórico condicional do ativo na direção da ideia."""
+    try:
+        return alvos.calcular(carregar(ticker), direcao)
+    except Exception:
+        return {"ok": False}
 
 
 def grafico(df: pd.DataFrame, ticker: str, candles: int) -> go.Figure:
@@ -184,6 +195,62 @@ def explicacoes(itens: list[tuple[str, str]]):
     """Lista de 'ativo — porquê'. O $ é escapado para o markdown não virar fórmula."""
     for ativo, texto in itens:
         st.markdown(f"- **{ativo}**: " + texto.replace("$", "\\$"))
+
+
+# ---- Alvo e gestão de saída (aba direcional) ---------------------------------
+VERDE = "background-color: rgba(46, 160, 90, 0.45)"
+AMARELO = "background-color: rgba(210, 153, 34, 0.45)"
+VERMELHO = "background-color: rgba(220, 70, 60, 0.45)"
+VERMELHO_FORTE = "background-color: rgba(220, 70, 60, 0.70)"
+COR_LEITURA = {
+    "Com espaço": VERDE, "Esticado": AMARELO, "Acima do alvo": AMARELO, "Abaixo do alvo": AMARELO,
+    "Sinal de saída": VERMELHO, "Stop curto rompido": VERMELHO_FORTE,
+}
+COL_MED = f"Mediana {alvos.HORIZONTE_FWD}d (hist.)"
+COL_ACERTO = f"% positivo {alvos.HORIZONTE_FWD}d"
+
+
+def cor_rr(v: float) -> str:
+    if pd.isna(v):
+        return ""
+    return VERDE if v >= 2 else AMARELO if v >= alvos.RR_MINIMA else VERMELHO
+
+
+def tabela_alvos(itens: list, direcao: int):
+    """Tabela de alvo/stop logo abaixo dos candidatos, com a leitura por ativo num expander."""
+    linhas, textos = [], []
+    for an, _, _ in itens:
+        r = alvos_ativo(an["ativo"], direcao)
+        textos.append((an["ativo"], alvos.texto(r)))
+        ok = r.get("ok", False)
+        v = (lambda k, sinal_=1: sinal_ * r[k] if ok else np.nan)
+        linhas.append({
+            "Ativo": an["ativo"], "Leitura": alvos.status(r),
+            "Alvo (Bollinger)": v("alvo"), "Espaço até alvo": v("espaco"),
+            "Stop curto (ATR)": v("stop"), "Risco até stop": v("risco", -1),
+            "Alvo/stop": v("rr"), "%B": v("pctb"), "Percentil esticamento": v("percentil"),
+            COL_MED: v("med_fwd"), COL_ACERTO: v("acerto_fwd"),
+            "Posição aberta": posicao_aberta(an["ativo"]),
+        })
+    tab = pd.DataFrame(linhas)
+    estilo = (
+        tab.style
+        .map(lambda s: COR_LEITURA.get(s, ""), subset=["Leitura"])
+        .map(cor_rr, subset=["Alvo/stop"])
+        .format({
+            "Alvo (Bollinger)": ou_traco(brl), "Stop curto (ATR)": ou_traco(brl),
+            "Espaço até alvo": ou_traco(pct_sinal), "Risco até stop": ou_traco(pct_sinal),
+            COL_MED: ou_traco(pct_sinal),
+            "Alvo/stop": ou_traco(lambda x: f"{x:.1f}x".replace(".", ",")),
+            "%B": ou_traco(lambda x: f"{x * 100:.0f}%"),
+            "Percentil esticamento": ou_traco(lambda x: f"{x:.0f}"),
+            COL_ACERTO: ou_traco(lambda x: f"{x:.0f}%"),
+        })
+    )
+    st.markdown("**Alvo e gestão de saída**")
+    st.dataframe(estilo, hide_index=True, use_container_width=True, height=40 + 35 * len(tab))
+    with st.expander("Leitura de alvo e saída por ativo"):
+        explicacoes(textos)
 
 
 # Barra lateral: controles de dados (valem para todas as abas)
@@ -339,6 +406,15 @@ with aba_direcional:
         f"Ideia direcional: força de {estrategias.SCORE_DIRECIONAL} ou mais (em módulo), com IFR fora de "
         f"sobrecompra ({estrategias.IFR_ALTO}) e sobrevenda ({estrategias.IFR_BAIXO})."
     )
+    st.caption(
+        f"Alvo e saída: o alvo é a banda de Bollinger ({alvos.BB_PERIODOS}, {alvos.BB_DESVIOS:g}σ) do lado da "
+        f"operação; o stop curto é o Chandelier ({alvos.CHANDELIER_JANELA} candles, {alvos.CHANDELIER_MULT:g}×ATR "
+        f"{alvos.ATR_PERIODOS}), mais perto que o HiLo. Alvo/stop = espaço até o alvo ÷ risco até o stop. "
+        "%B: 0% na banda inferior, 100% na superior. Percentil de esticamento: onde a distância atual à MM20 "
+        f"cai no histórico do ativo, no sentido da operação. Mediana e % positivo: retorno a favor "
+        f"{alvos.HORIZONTE_FWD} candles depois, em situações parecidas no passado (mesma faixa de %B, preço do "
+        "mesmo lado da MM20). Valores do ativo, não da opção: theta e volatilidade implícita ficam de fora."
+    )
     analises = analisar_universo(tuple(UNIVERSO))
     grupos = {"call": [], "put": [], "obs": []}
     for an in analises:
@@ -364,6 +440,7 @@ with aba_direcional:
         st.dataframe(estilo_ideias(tab), hide_index=True, use_container_width=True,
                      height=40 + 35 * len(tab))
         explicacoes([(an["ativo"], txt) for an, _, txt in itens])
+        tabela_alvos(itens, 1 if tipo == "call" else -1)
 
     itens = grupos["obs"]
     st.subheader(f"Em observação: tendência forte, mas esticada ({len(itens)})")
