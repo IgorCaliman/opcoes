@@ -7,6 +7,7 @@ from plotly.subplots import make_subplots
 import alvos
 import cotacoes
 import estrategias
+import indicadores
 import operacoes as ops_mod
 from indicadores import HILO_PERIODOS, IFR_PERIODOS, calcular, distancias_mm, sinal
 
@@ -52,31 +53,57 @@ ATIVOS = sorted(set(ATIVOS_BASE) | set(OPERACOES["ativo"]))
 UNIVERSO = sorted(set(ATIVOS) | set(WATCHLIST))
 
 
+@st.cache_data(ttl=900, show_spinner="Atualizando cotações...")
+def sincronizar(tickers: tuple) -> tuple[str, list[str]]:
+    """Atualiza o cache em disco de todos os ativos de uma vez (download em lote).
+
+    Devolve (versão, tickers sem dados). A versão entra na chave de cache das funções
+    abaixo: quando as cotações são atualizadas, os indicadores são recalculados juntos.
+    """
+    sem_dados = cotacoes.atualizar(list(tickers))
+    return pd.Timestamp.now().isoformat(), sem_dados
+
+
+VERSAO, SEM_DADOS = sincronizar(tuple(UNIVERSO))
+
+
 @st.cache_data(ttl=900, show_spinner=False)
+def _carregar(ticker: str, versao: str) -> pd.DataFrame:
+    """Histórico ajustado por proventos (lido do disco) + indicadores."""
+    return calcular(cotacoes.carregar_ajustado(ticker))
+
+
 def carregar(ticker: str) -> pd.DataFrame:
-    """Histórico (do cache em disco, atualizado só nos últimos dias) + indicadores."""
-    return calcular(cotacoes.obter(ticker))
+    return _carregar(ticker, VERSAO)
 
 
 @st.cache_data(ttl=900, show_spinner="Analisando ativos...")
-def analisar_universo(tickers: tuple) -> list[dict]:
+def _analisar_universo(tickers: tuple, versao: str) -> list[dict]:
     """Resumo de indicadores de cada ativo (usa os dados já em cache)."""
     saida = []
     for t in tickers:
         try:
-            saida.append({"ativo": t, **estrategias.analisar(carregar(t))})
+            saida.append({"ativo": t, **estrategias.analisar(_carregar(t, versao))})
         except Exception:
             pass
     return saida
 
 
+def analisar_universo(tickers: tuple) -> list[dict]:
+    return _analisar_universo(tickers, VERSAO)
+
+
 @st.cache_data(ttl=900, show_spinner=False)
-def alvos_ativo(ticker: str, direcao: int) -> dict:
-    """Alvo (Bollinger), stop curto (ATR) e histórico condicional do ativo na direção da ideia."""
+def _alvos_ativo(ticker: str, direcao: int, versao: str) -> dict:
     try:
-        return alvos.calcular(carregar(ticker), direcao)
+        return alvos.calcular(_carregar(ticker, versao), direcao)
     except Exception:
         return {"ok": False}
+
+
+def alvos_ativo(ticker: str, direcao: int) -> dict:
+    """Alvo (Bollinger), stop curto (ATR) e histórico condicional do ativo na direção da ideia."""
+    return _alvos_ativo(ticker, direcao, VERSAO)
 
 
 def grafico(df: pd.DataFrame, ticker: str, candles: int) -> go.Figure:
@@ -265,7 +292,7 @@ def tabela_alvos(itens: list, direcao: int):
         })
     )
     st.markdown("**Alvo e gestão de saída**")
-    st.dataframe(estilo, hide_index=True, use_container_width=True, height=40 + 35 * len(tab))
+    st.dataframe(estilo, hide_index=True, width="stretch", height=40 + 35 * len(tab))
     with st.expander("Leitura de alvo e saída por ativo"):
         explicacoes(textos)
 
@@ -273,17 +300,20 @@ def tabela_alvos(itens: list, direcao: int):
 # Barra lateral: controles de dados (valem para todas as abas)
 with st.sidebar:
     st.header("Dados")
-    if st.button("Atualizar cotações", use_container_width=True):
+    if st.button("Atualizar cotações", width="stretch"):
         st.cache_data.clear()
         st.rerun()
-    if st.button("Refazer histórico completo", use_container_width=True):
+    if st.button("Refazer histórico completo", width="stretch"):
         cotacoes.limpar_cache()
         st.cache_data.clear()
         st.rerun()
     st.caption(
-        "Atualizar baixa só os últimos dias. Refazer apaga a pasta dados/ e "
-        "baixa tudo de novo (use após desdobramentos/grupamentos)."
+        "Atualizar baixa só os últimos dias, em lote. Desdobramentos e grupamentos são "
+        "detectados sozinhos; Refazer apaga a pasta dados/ e baixa tudo de novo."
     )
+    st.caption("Preços e indicadores ajustados por proventos (dividendos e JCP).")
+    if SEM_DADOS:
+        st.warning("Sem dados: " + ", ".join(SEM_DADOS))
 
 (aba_ativo, aba_consolidado, aba_operacoes, aba_watch,
  aba_direcional, aba_travas) = st.tabs([
@@ -293,7 +323,7 @@ with st.sidebar:
 
 with aba_ativo:
     col1, col2 = st.columns([1, 1])
-    ticker = col1.selectbox("Ativo", ATIVOS, index=ATIVOS.index("PETR4"))
+    ticker = col1.selectbox("Ativo", ATIVOS, index=ATIVOS.index("PETR4") if "PETR4" in ATIVOS else 0)
     candles = col2.slider("Candles no gráfico", 60, 500, 180, step=20)
 
     try:
@@ -307,15 +337,16 @@ with aba_ativo:
     s = sinal(df)
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Último", f"R$ {ult['Close']:.2f}")
+    m1.metric("Último", f"R$ {ult['Close_bruto']:.2f}")
     m2.metric("Sinal HiLo", s)
     m3.metric(f"HiLo {HILO_PERIODOS}", f"{ult['HiLo']:.2f}" if pd.notna(ult["HiLo"]) else "—")
     m4.metric(f"IFR {IFR_PERIODOS}", f"{ult['IFR']:.1f}")
     m5.metric("MM9 / MM20", f"{ult['MM9']:.2f} / {ult['MM20']:.2f}")
     m6.metric("MM200", f"{ult['MM200']:.2f}" if pd.notna(ult["MM200"]) else "—")
 
-    st.plotly_chart(grafico(df, ticker, candles), use_container_width=True)
-    st.caption(f"Último candle: {df.index[-1]:%d/%m/%Y}")
+    st.plotly_chart(grafico(df, ticker, candles), width="stretch")
+    vol_txt = f" Vol. EWMA anualizada: {ult['Vol_EWMA'] * 100:.0f}%." if pd.notna(ult["Vol_EWMA"]) else ""
+    st.caption(f"Último candle: {df.index[-1]:%d/%m/%Y}. Gráfico e indicadores ajustados por proventos.{vol_txt}")
 
 with aba_consolidado:
     linhas = []
@@ -339,7 +370,7 @@ with aba_consolidado:
             else:
                 st.dataframe(
                     sub.style.map(lambda _, n=nome: cor_sinal(n), subset=["Ativo"]),
-                    hide_index=True, use_container_width=True,
+                    hide_index=True, width="stretch",
                     height=40 + 35 * len(sub),
                 )
     sem_sinal = tabela[~tabela["Sinal"].isin(["Call", "Put"])]["Ativo"]
@@ -362,7 +393,7 @@ with aba_operacoes:
         exibir = OPERACOES.rename(columns={"ativo": "Ativo", "tipo": "Tipo"})
         st.dataframe(
             exibir.style.map(cor_estrutura, subset=["Tipo"]),
-            hide_index=True, use_container_width=True,
+            hide_index=True, width="stretch",
             height=40 + 35 * len(exibir),
         )
 
@@ -402,7 +433,7 @@ with aba_watch:
             "Média MMs": ou_traco(brl),
             **{c: ou_traco(pct_sinal) for c in cols_dist},
         }),
-        hide_index=True, use_container_width=True,
+        hide_index=True, width="stretch",
         height=40 + 35 * len(tab_watch),
     )
     st.caption(
@@ -415,7 +446,7 @@ with aba_watch:
     t_watch = w1.selectbox("Ver gráfico do ativo", WATCHLIST, key="watch_ativo")
     c_watch = w2.slider("Candles no gráfico", 60, 500, 180, step=20, key="watch_candles")
     try:
-        st.plotly_chart(grafico(carregar(t_watch), t_watch, c_watch), use_container_width=True)
+        st.plotly_chart(grafico(carregar(t_watch), t_watch, c_watch), width="stretch")
     except Exception as e:
         st.error(f"Não foi possível carregar {t_watch}: {e}")
 
@@ -457,7 +488,7 @@ with aba_direcional:
             "Dist. MM20": an["d20"], "Dist. MM200": an["d200"], "Dias no sinal": an["dias"],
             "Posição aberta": posicao_aberta(an["ativo"]),
         } for an, rot, _ in itens])
-        st.dataframe(estilo_ideias(tab), hide_index=True, use_container_width=True,
+        st.dataframe(estilo_ideias(tab), hide_index=True, width="stretch",
                      height=40 + 35 * len(tab))
         explicacoes([(an["ativo"], txt) for an, _, txt in itens])
         tabela_alvos(itens, 1 if tipo == "call" else -1)
@@ -471,16 +502,16 @@ with aba_direcional:
             "Ativo": an["ativo"], "Situação": rot, "Último": an["preco"], "Força": an["score"],
             f"IFR {IFR_PERIODOS}": an["ifr"], "Posição aberta": posicao_aberta(an["ativo"]),
         } for an, rot, _ in itens])
-        st.dataframe(estilo_ideias(tab), hide_index=True, use_container_width=True,
+        st.dataframe(estilo_ideias(tab), hide_index=True, width="stretch",
                      height=40 + 35 * len(tab))
         explicacoes([(an["ativo"], txt) for an, _, txt in itens])
 
 with aba_travas:
     st.caption(AVISO)
     st.caption(
-        f"σ = desvio-padrão dos retornos diários dos últimos {estrategias.HORIZONTE} candles × raiz de "
-        f"{estrategias.HORIZONTE} × preço (movimento esperado de cerca de 1 mês). Os strikes são referências "
-        "calculadas sobre o ativo: use o strike listado mais próximo na cadeia."
+        f"σ = volatilidade diária EWMA (λ = {indicadores.EWMA_LAMBDA:g}) × raiz de {estrategias.HORIZONTE} × "
+        "preço (movimento esperado de cerca de 1 mês). Os strikes são referências calculadas sobre o ativo: "
+        "use o strike listado mais próximo na cadeia."
     )
     analises = analisar_universo(tuple(UNIVERSO))
     por_estrutura = {e: [] for e in estrategias.ESTRUTURAS}
@@ -500,6 +531,6 @@ with aba_travas:
             f"IFR {IFR_PERIODOS}": an["ifr"], "HiLo (stop ref.)": an["hilo"],
             "Strikes de referência": ideia["strikes"], "Posição aberta": posicao_aberta(an["ativo"]),
         } for an, ideia in itens])
-        st.dataframe(estilo_ideias(tab), hide_index=True, use_container_width=True,
+        st.dataframe(estilo_ideias(tab), hide_index=True, width="stretch",
                      height=40 + 35 * len(tab))
         explicacoes([(an["ativo"], ideia["texto"]) for an, ideia in itens])

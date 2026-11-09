@@ -2,9 +2,13 @@
 
 Tudo aqui é regra simples e explícita, para você ajustar os limites abaixo.
 Não usa preço de opção: os strikes são só referências calculadas sobre o ativo.
+O σ (movimento esperado) usa a volatilidade EWMA de indicadores.py, menos ruidosa
+que o desvio-padrão de uma janela curta.
 """
 import numpy as np
 import pandas as pd
+
+import indicadores
 
 # ---- Parâmetros (ajuste à vontade) -----------------------------------------
 HORIZONTE = 20          # candles (~1 mês) usados no movimento esperado (σ)
@@ -88,14 +92,16 @@ def analisar(df: pd.DataFrame) -> dict:
     # Força: HiLo pesa 2; MM9, MM20, MM200 e alinhamento pesam 1 cada (−6 a +6)
     score = 2 * tend + _sgn(d9) + _sgn(d20) + _sgn(d200) + alinh
 
-    ret = np.log(df["Close"]).diff().tail(HORIZONTE)
-    sigma = preco * float(ret.std()) * np.sqrt(HORIZONTE)  # movimento esperado de ~1 mês
+    # Movimento esperado de ~1 mês (1σ em reais), pela vol EWMA diária do último candle
+    vol_d = u["Vol_EWMA_d"] if "Vol_EWMA_d" in df.columns else indicadores.vol_ewma(df["Close"]).iloc[-1]
+    vol_d = float(vol_d) if pd.notna(vol_d) else np.nan
+    sigma = indicadores.movimento_esperado(preco, vol_d, HORIZONTE)
 
     return {
         "preco": preco, "tend": tend, "dias": dias, "viradas": viradas,
         "ifr": float(u["IFR"]), "hilo": float(u["HiLo"]) if pd.notna(u["HiLo"]) else np.nan,
         "d9": d9, "d20": d20, "d200": d200, "alinh": alinh,
-        "score": score, "sigma": sigma,
+        "score": score, "sigma": sigma, "vol_anual": vol_d * np.sqrt(indicadores.DIAS_ANO),
     }
 
 

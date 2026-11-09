@@ -18,33 +18,20 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-BB_PERIODOS = 20
-BB_DESVIOS = 2.0
-ATR_PERIODOS = 14
+import indicadores
+
+BB_PERIODOS = indicadores.BB_PERIODOS
+BB_DESVIOS = indicadores.BB_DESVIOS
+ATR_PERIODOS = indicadores.ATR_PERIODOS
 CHANDELIER_JANELA = 22
 CHANDELIER_MULT = 3.0
-IFR_PERIODOS = 9
+IFR_PERIODOS = indicadores.IFR_PERIODOS
 IFR_ALTO, IFR_BAIXO = 70, 30
 HORIZONTE_FWD = 5          # candles à frente no histórico condicional
 MIN_AMOSTRAS = 15          # abaixo disso o histórico condicional não é mostrado
 PCT_ESTICADO = 90          # percentil a partir do qual o preço é considerado esticado
 RR_MINIMA = 1.0            # relação alvo/stop abaixo disso é desfavorável
 JANELA_SINAL = 3           # sinais de saída valem se ocorreram nos últimos N candles
-
-
-# ---- Indicadores --------------------------------------------------------------
-def _ifr(c: pd.Series, n: int = IFR_PERIODOS) -> pd.Series:
-    d = c.diff()
-    ganho = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    perda = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    rs = ganho / perda.replace(0, np.nan)
-    return (100 - 100 / (1 + rs)).fillna(100)
-
-
-def _atr(df: pd.DataFrame, n: int = ATR_PERIODOS) -> pd.Series:
-    c_ant = df["Close"].shift()
-    tr = pd.concat([df["High"] - df["Low"], (df["High"] - c_ant).abs(), (df["Low"] - c_ant).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / n, adjust=False).mean()
 
 
 def _faixa_pctb(x: float, direcao: int) -> tuple[float, float]:
@@ -71,12 +58,10 @@ def calcular(df: pd.DataFrame, direcao: int) -> dict:
         return vazio
 
     c, h, l = df["Close"], df["High"], df["Low"]
-    mm20 = c.rolling(BB_PERIODOS).mean()
-    dp = c.rolling(BB_PERIODOS).std(ddof=0)
-    sup, inf_ = mm20 + BB_DESVIOS * dp, mm20 - BB_DESVIOS * dp
-    pctb = (c - inf_) / (sup - inf_)
-    atr = _atr(df)
-    ifr = _ifr(c)
+    bb = indicadores.bollinger(c, BB_PERIODOS, BB_DESVIOS)
+    mm20, sup, inf_, pctb = bb["BB_media"], bb["BB_sup"], bb["BB_inf"], bb["PctB"]
+    atr = indicadores.atr(df, ATR_PERIODOS)
+    ifr = indicadores.ifr(c, IFR_PERIODOS)
 
     p = float(c.iloc[-1])
     if direcao == 1:
