@@ -4,10 +4,14 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+from datetime import date
+
 import alvos
+import black_scholes as bs
 import cotacoes
 import estrategias
 import indicadores
+import opcoes_dados
 import operacoes as ops_mod
 from indicadores import HILO_PERIODOS, IFR_PERIODOS, calcular, distancias_mm, sinal
 
@@ -104,6 +108,17 @@ def _alvos_ativo(ticker: str, direcao: int, versao: str) -> dict:
 def alvos_ativo(ticker: str, direcao: int) -> dict:
     """Alvo (Bollinger), stop curto (ATR) e histórico condicional do ativo na direção da ideia."""
     return _alvos_ativo(ticker, direcao, VERSAO)
+
+
+@st.cache_data(ttl=3600, show_spinner="Baixando opções da B3 (COTAHIST)...")
+def pregao_opcoes(hoje: date):
+    """(data do pregão, DataFrame do COTAHIST) mais recente, ou None."""
+    return opcoes_dados.ultimo_pregao(hoje)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def selic_atual() -> float:
+    return bs.selic_meta()
 
 
 def grafico(df: pd.DataFrame, ticker: str, candles: int) -> go.Figure:
@@ -316,9 +331,9 @@ with st.sidebar:
         st.warning("Sem dados: " + ", ".join(SEM_DADOS))
 
 (aba_ativo, aba_consolidado, aba_operacoes, aba_watch,
- aba_direcional, aba_travas) = st.tabs([
+ aba_direcional, aba_travas, aba_cadeia) = st.tabs([
     "Ativo por ativo", "Consolidado", "Operações abertas", "Acompanhamento",
-    "Acompanhamento - direcional", "Acompanhamento - travas",
+    "Acompanhamento - direcional", "Acompanhamento - travas", "Cadeia de opções",
 ])
 
 with aba_ativo:
@@ -534,3 +549,111 @@ with aba_travas:
         st.dataframe(estilo_ideias(tab), hide_index=True, width="stretch",
                      height=40 + 35 * len(tab))
         explicacoes([(an["ativo"], ideia["texto"]) for an, ideia in itens])
+
+
+# ---- Cadeia de opções (dados de fim de dia da B3) -------------------------------------
+def fmt_cadeia(tab: pd.DataFrame):
+    pct0 = ou_traco(lambda v: f"{v * 100:.0f}%")
+    num2 = ou_traco(lambda v: f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    return tab.style.format({
+        "Strike": num2, "Dist.": ou_traco(pct_sinal), "Bid": num2, "Ask": num2, "Último": num2,
+        "Volume": ou_traco(lambda v: f"{v:,.0f}".replace(",", ".")), "Spread": pct0, "Vol. impl.": pct0,
+        "Delta": ou_traco(lambda v: f"{v:+.2f}".replace(".", ",")), "Prob. exercício": pct0,
+        "Theta/dia": ou_traco(lambda v: f"{v:+.3f}".replace(".", ",")),
+    }).map(cor_estrutura, subset=["Tipo"])
+
+
+with aba_cadeia:
+    st.caption(
+        "Fonte: arquivo COTAHIST da B3 (oficial, gratuito), publicado no fim de cada pregão: os dados são "
+        "do fechamento do último pregão disponível, não em tempo real. Bid/ask = melhores ofertas no "
+        "fechamento. Vol. implícita por Black-Scholes sobre o meio do book (ou o último negócio, se não "
+        "houver oferta dos dois lados), com taxa = Selic meta e prazo em dias úteis/252."
+    )
+    resultado = pregao_opcoes(date.today())
+    if resultado is None:
+        st.error("Não foi possível baixar o COTAHIST da B3 nos últimos pregões. Tente de novo mais tarde.")
+    else:
+        pregao, cotahist = resultado
+        selic = selic_atual()
+        com_opcoes = set(opcoes_dados.resumo_liquidez(cotahist).index)
+        lista = [t for t in UNIVERSO if t in com_opcoes] or sorted(com_opcoes)
+
+        c1, c2, c3 = st.columns([1, 1, 1])
+        ativo_op = c1.selectbox("Ativo", lista, index=lista.index("PETR4") if "PETR4" in lista else 0,
+                                key="cadeia_ativo")
+        vol_ref = None
+        try:
+            v = carregar(ativo_op)["Vol_EWMA"].iloc[-1]
+            vol_ref = float(v) if pd.notna(v) else None
+        except Exception:
+            pass
+        cad = opcoes_dados.cadeia(cotahist, ativo_op, pregao, selic, vol_ref)
+
+        if cad.empty:
+            st.caption("Sem opções para esse ativo no pregão.")
+        else:
+            vencs = cad.drop_duplicates("vencimento")[["vencimento", "du"]]
+            rotulos = {f"{r.vencimento:%d/%m/%Y} ({r.du} d.u.)": r.vencimento for r in vencs.itertuples()}
+            venc_sel = rotulos[c2.selectbox("Vencimento", list(rotulos), key="cadeia_venc")]
+            tipos = c3.multiselect("Tipo", ["Call", "Put"], default=["Call", "Put"], key="cadeia_tipo")
+            f1, f2 = st.columns([2, 1])
+            faixa = f1.slider("Distância do strike ao preço (%)", -50, 50, (-20, 20), step=5, key="cadeia_faixa")
+            so_negociadas = f2.checkbox("Só com negócio no pregão", value=False, key="cadeia_neg")
+
+            sub = cad[(cad["vencimento"] == venc_sel) & cad["tipo"].isin(tipos)
+                      & cad["dist"].between(faixa[0] / 100, faixa[1] / 100)]
+            if so_negociadas:
+                sub = sub[sub["negocios"] > 0]
+
+            do_venc = cad[cad["vencimento"] == venc_sel]
+            atm = do_venc.loc[(do_venc["dist"].abs() <= 0.03), "iv"].dropna()
+            iv_atm = float(atm.mean()) if len(atm) else np.nan
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Preço (fech. B3)", brl(float(cad["spot"].iloc[0])))
+            m2.metric("Pregão", f"{pregao:%d/%m/%Y}")
+            m3.metric("Selic meta", f"{selic * 100:.2f}%".replace(".", ","))
+            m4.metric("Vol. impl. ATM", "—" if pd.isna(iv_atm) else f"{iv_atm * 100:.0f}%")
+            m5.metric("Vol. EWMA do ativo", "—" if vol_ref is None else f"{vol_ref * 100:.0f}%",
+                      None if (vol_ref is None or pd.isna(iv_atm)) else
+                      f"IV/vol = {iv_atm / vol_ref:.2f}x".replace(".", ","), delta_color="off")
+
+            tab = sub.rename(columns={
+                "opcao": "Opção", "tipo": "Tipo", "strike": "Strike", "dist": "Dist.", "moneyness": "Situação",
+                "bid": "Bid", "ask": "Ask", "ultimo": "Último", "negocios": "Negócios", "volume": "Volume",
+                "spread": "Spread", "iv": "Vol. impl.", "delta": "Delta", "prob_exercicio": "Prob. exercício",
+                "theta": "Theta/dia",
+            })[["Opção", "Tipo", "Strike", "Dist.", "Situação", "Bid", "Ask", "Último", "Negócios", "Volume",
+                "Spread", "Vol. impl.", "Delta", "Prob. exercício", "Theta/dia"]]
+            st.dataframe(fmt_cadeia(tab), hide_index=True, width="stretch",
+                         height=min(40 + 35 * len(tab), 700))
+            st.caption(
+                "Dist. = strike ÷ preço − 1. Prob. exercício = N(d2), probabilidade neutra a risco de vencer "
+                "dentro do dinheiro. Theta em R$ por dia útil. Quando não dá para calcular a vol implícita, "
+                "as gregas usam a vol EWMA do ativo."
+            )
+
+            fig = go.Figure()
+            for tipo, cor in (("Call", COR_HILO_ALTA), ("Put", COR_HILO_BAIXA)):
+                d = do_venc[(do_venc["tipo"] == tipo) & do_venc["iv"].notna()]
+                fig.add_trace(go.Scatter(x=d["strike"], y=d["iv"] * 100, mode="lines+markers", name=tipo,
+                                         line=dict(color=cor), text=d["opcao"],
+                                         hovertemplate="%{text}<br>Strike %{x:.2f}<br>IV %{y:.0f}%"))
+            fig.add_vline(x=float(cad["spot"].iloc[0]), line_dash="dash", line_color="gray")
+            if vol_ref:
+                fig.add_hline(y=vol_ref * 100, line_dash="dot", line_color=COR_MM20,
+                              annotation_text="vol EWMA", annotation_position="top left")
+            fig.update_layout(title="Smile de volatilidade implícita", height=380, xaxis_title="Strike",
+                              yaxis_title="Vol. implícita (%)", margin=dict(l=10, r=10, t=40, b=10),
+                              legend=dict(orientation="h"))
+            st.plotly_chart(fig, width="stretch")
+
+        with st.expander("Liquidez em opções por ativo no pregão"):
+            liq = opcoes_dados.resumo_liquidez(cotahist).head(40).reset_index()
+            liq["No universo"] = liq["ativo"].isin(UNIVERSO).map({True: "Sim", False: ""})
+            st.dataframe(
+                liq.rename(columns={"ativo": "Ativo", "series": "Séries", "negocios": "Negócios",
+                                    "volume": "Volume (R$)"})
+                .style.format({"Volume (R$)": lambda v: f"{v:,.0f}".replace(",", ".")}),
+                hide_index=True, width="stretch",
+            )
