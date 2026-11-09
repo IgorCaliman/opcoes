@@ -13,6 +13,7 @@ import estrategias
 import indicadores
 import opcoes_dados
 import operacoes as ops_mod
+import pozinhos as pz
 from indicadores import HILO_PERIODOS, IFR_PERIODOS, calcular, distancias_mm, sinal
 
 # Lista principal de ativos (sem o ".SA"). Ativos de operações abertas que não
@@ -331,9 +332,9 @@ with st.sidebar:
         st.warning("Sem dados: " + ", ".join(SEM_DADOS))
 
 (aba_ativo, aba_consolidado, aba_operacoes, aba_watch,
- aba_direcional, aba_travas, aba_cadeia) = st.tabs([
+ aba_direcional, aba_travas, aba_cadeia, aba_pozinhos) = st.tabs([
     "Ativo por ativo", "Consolidado", "Operações abertas", "Acompanhamento",
-    "Acompanhamento - direcional", "Acompanhamento - travas", "Cadeia de opções",
+    "Acompanhamento - direcional", "Acompanhamento - travas", "Cadeia de opções", "Pozinhos",
 ])
 
 with aba_ativo:
@@ -656,4 +657,152 @@ with aba_cadeia:
                                     "volume": "Volume (R$)"})
                 .style.format({"Volume (R$)": lambda v: f"{v:,.0f}".replace(",", ".")}),
                 hide_index=True, width="stretch",
+            )
+
+
+# ---- Pozinhos -------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner="Calculando pozinhos...")
+def _listar_pozinhos(hoje: date, versao: str, selic: float) -> tuple[date | None, pd.DataFrame]:
+    resultado = pregao_opcoes(hoje)
+    if resultado is None:
+        return None, pd.DataFrame()
+    pregao, cotahist = resultado
+    historicos, analises = {}, {}
+    for an in _analisar_universo(tuple(UNIVERSO), versao):
+        analises[an["ativo"]] = an
+    for t in UNIVERSO:
+        try:
+            historicos[t] = _carregar(t, versao)
+        except Exception:
+            pass
+    return pregao, pz.listar(cotahist, pregao, selic, historicos, analises)
+
+
+def cor_retorno(v: float) -> str:
+    if pd.isna(v):
+        return ""
+    return VERDE if v > 0 else VERMELHO if v < -0.5 else AMARELO
+
+
+def cor_sigma(v: float) -> str:
+    if pd.isna(v):
+        return ""
+    return VERDE if v <= 1 else AMARELO if v <= 2 else VERMELHO
+
+
+COLS_POZ = {
+    "opcao": "Opção", "ativo": "Ativo", "tipo": "Tipo", "vencimento": "Venc.", "du": "d.u.",
+    "strike": "Strike", "dist": "Dist.", "premio": "Prêmio", "bid": "Bid", "negocios": "Negócios",
+    "sinal": "Sinal HiLo", "forca": "Força", "sigma_be": "σ até breakeven", "prob_bs": "Prob. B&S",
+    "prob_venc": "Prob. venc. (hist.)", "prob_toque": "Prob. toque (hist.)",
+    "ret_esperado": "Ret. esperado (hist.)", "mult_2s": "Mult. em 2σ",
+}
+ORDENS_POZ = {
+    "Retorno esperado (hist.)": ("ret_esperado", False), "Prob. de toque (hist.)": ("prob_toque", False),
+    "Mult. em 2σ": ("mult_2s", False), "Menos σ até o breakeven": ("sigma_be", True),
+    "Mais negociados": ("negocios", False),
+}
+
+with aba_pozinhos:
+    st.caption(
+        "Pozinhos = opções fora do dinheiro com prêmio de até R$ 0,15 (ask do fechamento, ou o último negócio), "
+        "nos ativos da lista principal e do acompanhamento. Dados de fim de dia do COTAHIST da B3. "
+        "Probabilidades e retorno 'hist.' vêm do histórico ajustado do próprio ativo, em janelas com o mesmo "
+        "prazo da opção; não são previsão."
+    )
+    pregao_poz, poz = _listar_pozinhos(date.today(), VERSAO, selic_atual())
+    if pregao_poz is None:
+        st.error("Não foi possível baixar o COTAHIST da B3 nos últimos pregões. Tente de novo mais tarde.")
+    elif poz.empty:
+        st.caption("Nenhum pozinho encontrado nos ativos do universo.")
+    else:
+        f1, f2, f3, f4 = st.columns([1, 2, 2, 2])
+        tipos_poz = f1.multiselect("Tipo", ["Call", "Put"], default=["Call", "Put"], key="poz_tipo")
+        faixas = f2.multiselect("Faixa de prêmio", list(pz.FAIXAS), default=list(pz.FAIXAS), key="poz_faixa")
+        du_max = f3.slider("Prazo máximo (dias úteis)", 1, pz.DU_MAX, 30, key="poz_du")
+        ordem = f4.selectbox("Ordenar por", list(ORDENS_POZ), key="poz_ordem")
+        g1, g2, g3, _ = st.columns([1, 1, 1, 1])
+        so_alinhados = g1.checkbox("Só alinhados com o HiLo", value=True, key="poz_alinhado")
+        com_bid = g2.checkbox("Exige oferta de compra", value=False, key="poz_bid",
+                              help="Só opções com bid no fechamento: dá para vender antes do vencimento.")
+        com_neg = g3.checkbox("Só com negócio no pregão", value=False, key="poz_neg")
+
+        filtro = poz["tipo"].isin(tipos_poz) & (poz["du"] <= du_max)
+        if faixas:
+            na_faixa = pd.Series(False, index=poz.index)
+            for nome in faixas:
+                lo, hi = pz.FAIXAS[nome]
+                na_faixa |= poz["premio"].between(lo, hi + 1e-9)
+            filtro &= na_faixa
+        if so_alinhados:
+            filtro &= poz["alinhado"]
+        if com_bid:
+            filtro &= poz["bid"].notna()
+        if com_neg:
+            filtro &= poz["negocios"] > 0
+        sel = poz[filtro]
+        col, asc = ORDENS_POZ[ordem]
+        sel = sel.sort_values(col, ascending=asc, na_position="last")
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Pregão", f"{pregao_poz:%d/%m/%Y}")
+        m2.metric("Pozinhos no filtro", f"{len(sel)} de {len(poz)}")
+        m3.metric("Com retorno hist. positivo", int((sel["ret_esperado"] > 0).sum()))
+        m4.metric("Com bid (saída possível)", int(sel["bid"].notna().sum()))
+
+        if sel.empty:
+            st.caption("Nenhum pozinho com esses filtros.")
+        else:
+            tab = sel[list(COLS_POZ)].rename(columns=COLS_POZ)
+            pct1 = ou_traco(lambda v: f"{v * 100:.1f}%".replace(".", ","))
+            num2 = ou_traco(lambda v: f"{v:.2f}".replace(".", ","))
+            estilo = (
+                tab.style
+                .map(cor_estrutura, subset=["Tipo"])
+                .map(cor_sinal, subset=["Sinal HiLo"])
+                .map(cor_retorno, subset=["Ret. esperado (hist.)"])
+                .map(cor_sigma, subset=["σ até breakeven"])
+                .format({
+                    "Venc.": lambda v: f"{v:%d/%m/%y}", "Strike": num2, "Dist.": ou_traco(pct_sinal),
+                    "Prêmio": num2, "Bid": num2, "Força": ou_traco(lambda v: f"{int(v):+d}"),
+                    "σ até breakeven": ou_traco(lambda v: f"{v:.1f}σ".replace(".", ",")),
+                    "Prob. B&S": pct1, "Prob. venc. (hist.)": pct1, "Prob. toque (hist.)": pct1,
+                    "Ret. esperado (hist.)": ou_traco(lambda v: f"{v * 100:+.0f}%"),
+                    "Mult. em 2σ": ou_traco(lambda v: f"{v:.1f}x".replace(".", ",")),
+                })
+            )
+            st.dataframe(estilo, hide_index=True, width="stretch", height=min(40 + 35 * len(tab), 600))
+
+            st.markdown("**Detalhe do pozinho**")
+            escolha = st.selectbox("Opção", sel["opcao"].tolist(), key="poz_detalhe")
+            o = sel[sel["opcao"] == escolha].iloc[0]
+            st.markdown(pz.leitura(o).replace("$", "\\$"))
+            jan = pz.janelas(_carregar(o["ativo"], VERSAO), int(o["du"]))
+            if jan is not None:
+                fig = go.Figure(go.Histogram(x=jan["fim"] * 100, nbinsx=60, marker_color=COR_IFR,
+                                             name=f"Retorno em {o['du']} d.u."))
+                fig.add_vline(x=o["dist_be"] * 100, line_dash="dash",
+                              line_color=COR_HILO_ALTA if o["tipo"] == "Call" else COR_HILO_BAIXA,
+                              annotation_text="breakeven", annotation_position="top")
+                fig.update_layout(
+                    title=f"{o['ativo']}: retornos históricos em {o['du']} pregões ({jan['n']} janelas)",
+                    height=330, xaxis_title="Retorno (%)", yaxis_title="Janelas", showlegend=False,
+                    margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fig, width="stretch")
+
+        with st.expander("Como ler as colunas"):
+            st.markdown(
+                "- **σ até breakeven**: quanto o ativo precisa andar até o vencimento, em desvios-padrão da vol "
+                "EWMA. Até 1σ (verde) é movimento comum; acima de 2σ (vermelho) é aposta de cauda.\n"
+                "- **Prob. B&S**: probabilidade, embutida no preço, de vencer além do breakeven.\n"
+                "- **Prob. venc. / toque (hist.)**: fração das janelas históricas de mesmo prazo em que o ativo "
+                "terminou além do breakeven / chegou a tocá-lo em algum momento. O toque importa porque você "
+                "costuma zerar antes do vencimento.\n"
+                "- **Ret. esperado (hist.)**: média do payoff no vencimento, aplicando cada retorno histórico ao "
+                "preço de hoje, dividida pelo prêmio, menos 1. Positivo = no passado, o bilhete pagou mais do que "
+                "custou. As janelas se sobrepõem e o histórico é de ~3 anos: trate como triagem, não como edge "
+                "garantido.\n"
+                "- **Mult. em 2σ**: quantas vezes o prêmio a opção vale no vencimento se o ativo andar 2σ a favor.\n"
+                "- **Bid vazio**: sem comprador no fechamento. Em pozinho isso é comum e significa que a saída "
+                "antecipada pode não existir."
             )
