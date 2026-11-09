@@ -1,3 +1,5 @@
+import io
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -11,6 +13,7 @@ import black_scholes as bs
 import cotacoes
 import estrategias
 import indicadores
+import mercado
 import opcoes_dados
 import operacoes as ops_mod
 import pozinhos as pz
@@ -109,6 +112,26 @@ def _alvos_ativo(ticker: str, direcao: int, versao: str) -> dict:
 def alvos_ativo(ticker: str, direcao: int) -> dict:
     """Alvo (Bollinger), stop curto (ATR) e histórico condicional do ativo na direção da ideia."""
     return _alvos_ativo(ticker, direcao, VERSAO)
+
+
+def _historicos(versao: str) -> dict[str, pd.DataFrame]:
+    saida = {}
+    for t in UNIVERSO:
+        try:
+            saida[t] = _carregar(t, versao)
+        except Exception:
+            pass
+    return saida
+
+
+@st.cache_data(ttl=900, show_spinner="Lendo o regime de mercado...")
+def _contexto_mercado(versao: str) -> tuple[dict, pd.DataFrame]:
+    hist = _historicos(versao)
+    amp = mercado.amplitude(hist)
+    return mercado.regime(hist.get(mercado.INDICE), amp), amp
+
+
+REGIME, AMPLITUDE = _contexto_mercado(VERSAO)
 
 
 @st.cache_data(ttl=3600, show_spinner="Baixando opções da B3 (COTAHIST)...")
@@ -248,7 +271,16 @@ def estilo_ideias(tab: pd.DataFrame):
     }
     est = tab.style.format({c: ou_traco(f) for c, f in mapa.items() if c in tab.columns})
     dist = [c for c in ("Dist. MM20", "Dist. MM200") if c in tab.columns]
-    return est.map(cor_dist, subset=dist) if dist else est
+    if dist:
+        est = est.map(cor_dist, subset=dist)
+    if "Mercado" in tab.columns:
+        est = est.map(cor_mercado, subset=["Mercado"])
+    return est
+
+
+def cor_mercado(v: str) -> str:
+    return {"A favor": "background-color: rgba(46, 160, 90, 0.35)",
+            "Contra": "background-color: rgba(220, 70, 60, 0.35)"}.get(v, "")
 
 
 def explicacoes(itens: list[tuple[str, str]]):
@@ -331,9 +363,9 @@ with st.sidebar:
     if SEM_DADOS:
         st.warning("Sem dados: " + ", ".join(SEM_DADOS))
 
-(aba_ativo, aba_consolidado, aba_operacoes, aba_watch,
+(aba_ativo, aba_consolidado, aba_operacoes, aba_mercado, aba_watch,
  aba_direcional, aba_travas, aba_cadeia, aba_pozinhos) = st.tabs([
-    "Ativo por ativo", "Consolidado", "Operações abertas", "Acompanhamento",
+    "Ativo por ativo", "Consolidado", "Operações abertas", "Mercado e exposição", "Acompanhamento",
     "Acompanhamento - direcional", "Acompanhamento - travas", "Cadeia de opções", "Pozinhos",
 ])
 
@@ -467,6 +499,7 @@ with aba_watch:
         st.error(f"Não foi possível carregar {t_watch}: {e}")
 
 with aba_direcional:
+    st.info(f"Regime de mercado: **{REGIME['rotulo']}**. {REGIME['texto']}")
     st.caption(AVISO)
     st.caption(
         "Força de −6 a +6: HiLo vale 2 pontos; MM9, MM20, MM200 e o alinhamento entre elas valem 1 cada. "
@@ -502,6 +535,7 @@ with aba_direcional:
             "Ativo": an["ativo"], "Operação": rot, "Último": an["preco"], "Força": an["score"],
             "HiLo (stop ref.)": an["hilo"], f"IFR {IFR_PERIODOS}": an["ifr"],
             "Dist. MM20": an["d20"], "Dist. MM200": an["d200"], "Dias no sinal": an["dias"],
+            "Mercado": mercado.mercado_a_favor(tipo, REGIME),
             "Posição aberta": posicao_aberta(an["ativo"]),
         } for an, rot, _ in itens])
         st.dataframe(estilo_ideias(tab), hide_index=True, width="stretch",
@@ -523,6 +557,7 @@ with aba_direcional:
         explicacoes([(an["ativo"], txt) for an, _, txt in itens])
 
 with aba_travas:
+    st.info(f"Regime de mercado: **{REGIME['rotulo']}**. {REGIME['texto']}")
     st.caption(AVISO)
     st.caption(
         f"σ = volatilidade diária EWMA (λ = {indicadores.EWMA_LAMBDA:g}) × raiz de {estrategias.HORIZONTE} × "
@@ -545,7 +580,11 @@ with aba_travas:
         tab = pd.DataFrame([{
             "Ativo": an["ativo"], "Último": an["preco"], "Força": an["score"],
             f"IFR {IFR_PERIODOS}": an["ifr"], "HiLo (stop ref.)": an["hilo"],
-            "Strikes de referência": ideia["strikes"], "Posição aberta": posicao_aberta(an["ativo"]),
+            "Strikes de referência": ideia["strikes"],
+            "Mercado": ("Neutro" if estrutura == estrategias.NEUTRA else
+                        mercado.mercado_a_favor("call" if estrutura in (estrategias.ALTA_DEB, estrategias.ALTA_CRED)
+                                                else "put", REGIME)),
+            "Posição aberta": posicao_aberta(an["ativo"]),
         } for an, ideia in itens])
         st.dataframe(estilo_ideias(tab), hide_index=True, width="stretch",
                      height=40 + 35 * len(tab))
@@ -693,7 +732,7 @@ def cor_sigma(v: float) -> str:
 COLS_POZ = {
     "opcao": "Opção", "ativo": "Ativo", "tipo": "Tipo", "vencimento": "Venc.", "du": "d.u.",
     "strike": "Strike", "dist": "Dist.", "premio": "Prêmio", "bid": "Bid", "negocios": "Negócios",
-    "sinal": "Sinal HiLo", "forca": "Força", "sigma_be": "σ até breakeven", "prob_bs": "Prob. B&S",
+    "sinal": "Sinal HiLo", "mercado": "Mercado", "forca": "Força", "sigma_be": "σ até breakeven", "prob_bs": "Prob. B&S",
     "prob_venc": "Prob. venc. (hist.)", "prob_toque": "Prob. toque (hist.)",
     "ret_esperado": "Ret. esperado (hist.)", "mult_2s": "Mult. em 2σ",
 }
@@ -740,7 +779,8 @@ with aba_pozinhos:
             filtro &= poz["bid"].notna()
         if com_neg:
             filtro &= poz["negocios"] > 0
-        sel = poz[filtro]
+        sel = poz[filtro].copy()
+        sel["mercado"] = sel["tipo"].map(lambda t: mercado.mercado_a_favor(t, REGIME))
         col, asc = ORDENS_POZ[ordem]
         sel = sel.sort_values(col, ascending=asc, na_position="last")
 
@@ -760,6 +800,7 @@ with aba_pozinhos:
                 tab.style
                 .map(cor_estrutura, subset=["Tipo"])
                 .map(cor_sinal, subset=["Sinal HiLo"])
+                .map(cor_mercado, subset=["Mercado"])
                 .map(cor_retorno, subset=["Ret. esperado (hist.)"])
                 .map(cor_sigma, subset=["σ até breakeven"])
                 .format({
@@ -806,3 +847,130 @@ with aba_pozinhos:
                 "- **Bid vazio**: sem comprador no fechamento. Em pozinho isso é comum e significa que a saída "
                 "antecipada pode não existir."
             )
+
+
+# ---- Mercado e exposição -------------------------------------------------------------
+COR_REGIME = {"Alta ampla": "#00c853", "Alta estreita": "#9ccc65", "Misto": "#9e9e9e",
+              "Baixa estreita": "#ff8a65", "Baixa ampla": "#ff1744", "Indefinido": "#9e9e9e"}
+
+
+@st.cache_data(ttl=900, show_spinner="Calculando exposição...")
+def _exposicao(versao: str, ops_csv: str) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
+    ops = pd.read_json(io.StringIO(ops_csv))
+    hist = _historicos(versao)
+    return mercado.exposicao(ops, hist)
+
+
+with aba_mercado:
+    # Regime
+    st.subheader("Regime de mercado")
+    cor = COR_REGIME.get(REGIME["rotulo"], "#9e9e9e")
+    st.markdown(f"<span style='background:{cor};color:#000;padding:4px 10px;border-radius:6px;"
+                f"font-weight:600'>{REGIME['rotulo']}</span>", unsafe_allow_html=True)
+    st.markdown(REGIME["texto"])
+    if not AMPLITUDE.empty:
+        try:
+            ind = carregar(mercado.INDICE).tail(len(AMPLITUDE) + 5)
+        except Exception:
+            ind = None
+        u = AMPLITUDE.iloc[-1]
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("% em Call (HiLo)", f"{u['pct_call'] * 100:.0f}%",
+                  f"{(u['pct_call'] - AMPLITUDE['pct_call'].iloc[-6]) * 100:+.0f} p.p. em 5 dias"
+                  if len(AMPLITUDE) > 6 else None)
+        r2.metric("% acima da MM200", f"{u['pct_mm200'] * 100:.0f}%")
+        r3.metric("% acima da MM20", f"{u['pct_mm20'] * 100:.0f}%")
+        r4.metric("Ativos na amplitude", int(u["n"]))
+
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+        for col, nome, cor_l in (("pct_call", "% em Call (HiLo)", COR_HILO_ALTA),
+                                 ("pct_mm200", "% acima MM200", COR_MM200),
+                                 ("pct_mm20", "% acima MM20", COR_MM20)):
+            fig.add_trace(go.Scatter(x=AMPLITUDE.index, y=AMPLITUDE[col] * 100, name=nome,
+                                     line=dict(color=cor_l, width=2)), secondary_y=False)
+        if ind is not None:
+            ind = ind[ind.index >= AMPLITUDE.index[0]]
+            fig.add_trace(go.Scatter(x=ind.index, y=ind["Close"], name=mercado.INDICE,
+                                     line=dict(color="gray", width=1.5, dash="dot")), secondary_y=True)
+        fig.add_hline(y=50, line_dash="dash", line_color="gray")
+        fig.update_yaxes(title_text="% do universo", range=[0, 100], secondary_y=False)
+        fig.update_yaxes(title_text=mercado.INDICE, secondary_y=True, showgrid=False)
+        fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h"))
+        st.plotly_chart(fig, width="stretch")
+        st.caption(
+            f"Amplitude calculada sobre o universo (lista principal + acompanhamento, sem índices). "
+            f"Alta/baixa 'ampla' quando {mercado.AMPLA * 100:.0f}% ou mais (ou {mercado.ESTREITA * 100:.0f}% ou "
+            f"menos) do universo está em Call. As abas de ideias e de pozinhos mostram a coluna Mercado: "
+            "se a ideia está a favor ou contra o regime."
+        )
+
+    # Exposição
+    st.divider()
+    st.subheader("Exposição das operações abertas")
+    if OPERACOES.empty:
+        st.caption("Nenhuma operação aberta.")
+    else:
+        exp, resumo, adj = _exposicao(VERSAO, OPERACOES.to_json())
+        e1, e2, e3, e4 = st.columns(4)
+        e1.metric("Operações", f"{resumo['call']} Call · {resumo['put']} Put")
+        e2.metric("Beta líquido médio", f"{resumo['beta_liquido']:+.2f}".replace(".", ","),
+                  help="Média de (Call = +1, Put = −1) × beta contra o BOVA11. −1 = o livro se comporta como "
+                       "uma put no índice; 0 = neutro ao mercado.")
+        n_eff = resumo["apostas_independentes"]
+        e3.metric("Apostas independentes", "—" if pd.isna(n_eff) else f"{n_eff:.1f}".replace(".", ","),
+                  help="n² ÷ Σ dᵢdⱼρᵢⱼ. Quanto mais as operações andam juntas na mesma direção, menor o número.")
+        e4.metric("Com HiLo contra a posição", resumo["contra_hilo"])
+
+        tab = exp.rename(columns={"ativo": "Ativo", "tipo": "Tipo", "setor": "Setor", "grupo": "Grupo",
+                                  "beta": "Beta", "vol": "Vol. EWMA", "hilo_a_favor": "HiLo a favor"})
+        tab = tab[["Ativo", "Tipo", "Setor", "Grupo", "Beta", "Vol. EWMA", "HiLo a favor"]]
+        tab["Mercado"] = tab["Tipo"].map(lambda t: mercado.mercado_a_favor(t, REGIME))
+        st.dataframe(
+            tab.style.map(cor_estrutura, subset=["Tipo"])
+            .map(lambda v: cor_mercado({"Sim": "A favor", "Não": "Contra"}.get(v, "")), subset=["HiLo a favor"])
+            .map(cor_mercado, subset=["Mercado"])
+            .format({"Beta": ou_traco(lambda v: f"{v:.2f}".replace(".", ",")),
+                     "Vol. EWMA": ou_traco(lambda v: f"{v * 100:.0f}%")}),
+            hide_index=True, width="stretch", height=40 + 35 * len(tab),
+        )
+
+        x1, x2 = st.columns([1, 1])
+        por_grupo = exp.groupby(["grupo", "tipo"]).size().unstack(fill_value=0)
+        fig_g = go.Figure()
+        for tipo, cor_b in (("Call", COR_HILO_ALTA), ("Put", COR_HILO_BAIXA)):
+            if tipo in por_grupo:
+                fig_g.add_trace(go.Bar(y=por_grupo.index, x=por_grupo[tipo] * (1 if tipo == "Call" else -1),
+                                       name=tipo, orientation="h", marker_color=cor_b))
+        fig_g.update_layout(title="Operações por grupo (Put à esquerda, Call à direita)", barmode="relative",
+                            height=360, margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h"))
+        x1.plotly_chart(fig_g, width="stretch")
+
+        if not adj.empty:
+            fig_c = go.Figure(go.Heatmap(z=adj.to_numpy(), x=adj.columns, y=adj.index, zmin=-1, zmax=1, zmid=0,
+                                         colorscale="RdYlGn", reversescale=True,
+                                         hovertemplate="%{y} × %{x}: %{z:.2f}<extra></extra>"))
+            fig_c.update_layout(title="Correlação ajustada pela direção", height=360,
+                                margin=dict(l=10, r=10, t=40, b=10))
+            x2.plotly_chart(fig_c, width="stretch")
+        st.caption(
+            f"Beta e correlação com retornos diários dos últimos {mercado.JANELA_BETA} pregões (preços ajustados). "
+            "No mapa, vermelho = as duas operações ganham e perdem juntas (mesma aposta); verde = uma protege a "
+            "outra. Cada operação pesa igual, já que o app não guarda tamanho."
+        )
+
+        st.markdown("**Cenário: e se o índice andar?**")
+        mov = st.slider(f"Movimento do {mercado.INDICE} em um dia (%)", -8.0, 8.0, 3.0, step=0.5, key="cen_mov")
+        cen = mercado.cenario(exp, mov / 100)
+        contra = cen[cen["situacao"] == "Contra"]
+        mov_txt = f"{mov:+.1f}".replace(".", ",")
+        st.caption(f"Com o {mercado.INDICE} {mov_txt}%, {len(contra)} de {len(cen)} operações andariam contra, "
+                   "pelo beta de cada ativo.")
+        st.dataframe(
+            cen.rename(columns={"ativo": "Ativo", "tipo": "Tipo", "beta": "Beta",
+                                "mov_esperado": "Mov. esperado do ativo", "situacao": "Situação"})
+            [["Ativo", "Tipo", "Beta", "Mov. esperado do ativo", "Situação"]]
+            .style.map(cor_estrutura, subset=["Tipo"]).map(cor_mercado, subset=["Situação"])
+            .format({"Beta": ou_traco(lambda v: f"{v:.2f}".replace(".", ",")),
+                     "Mov. esperado do ativo": ou_traco(pct_sinal)}),
+            hide_index=True, width="stretch", height=40 + 35 * len(cen),
+        )
