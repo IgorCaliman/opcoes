@@ -927,25 +927,39 @@ with aba_hot:
                                 key="hot_alvo")
         du_hot = h3.slider("Prazo máximo (dias úteis)", 1, pz.DU_MAX, 30, key="hot_du")
         n_picks = h4.number_input("Quantos picks", 2, 20, 6, step=2, key="hot_n")
-        i1, i2, i3 = st.columns(3)
+        i1, i2, i3, i4 = st.columns(4)
         sem_sem_hot = i1.checkbox("Sem vencimentos semanais", value=True, key="hot_semanal")
         alinh_hot = i2.checkbox("Só alinhados com o HiLo", value=True, key="hot_alinhado")
         merc_hot = i3.checkbox("Excluir os contra o regime de mercado", value=False, key="hot_mercado")
+        um_por_ativo = i4.checkbox("Um pick por ativo", value=False, key="hot_um_por_ativo",
+                                   help="Nos cartões, mostra só o melhor pozinho de cada ativo.")
+        # Opções vêm do universo inteiro (não dos picks filtrados) para a seleção não sumir ao mudar outros filtros.
+        excluir_hot = st.multiselect(
+            "Excluir ativos", sorted(poz_hot["ativo"].unique()), key="hot_excluir", placeholder="Ex.: BBAS3",
+            help="Tira o ativo dos cartões e do ranking, para ver os próximos da fila.",
+        )
         alvo = ALVO_ROTULOS[alvo_rot]
 
         picks = pz.hot_picks(poz_hot, alvo, tuple(tipos_hot), du_hot, sem_sem_hot, alinh_hot, a_favor_regime, merc_hot)
+        if excluir_hot:
+            picks = picks[~picks["ativo"].isin(excluir_hot)].reset_index(drop=True)
         positivos = picks[picks["ev"] > 0]
+        txt_excl = f" · excluídos: {', '.join(excluir_hot)}" if excluir_hot else ""
         st.markdown(f"Pregão de **{pregao_hot:%d/%m/%Y}** · regime **{REGIME['rotulo']}** · "
-                    f"{len(positivos)} de {len(picks)} pozinhos negociáveis com EV positivo zerando em {alvo_rot}.")
+                    f"{len(positivos)} de {len(picks)} pozinhos negociáveis com EV positivo zerando em {alvo_rot}"
+                    f"{txt_excl}.")
 
         if picks.empty:
             st.info("Nenhum pozinho negociável com esses filtros.")
         else:
             if positivos.empty:
                 st.warning("Nenhum pozinho com EV positivo hoje. Abaixo, os menos piores: só se tiver convicção própria.")
-                mostrar = picks.head(int(n_picks))
+                base = picks
             else:
-                mostrar = positivos.head(int(n_picks))
+                base = positivos
+            if um_por_ativo:
+                base = base.drop_duplicates("ativo")  # já vem ordenado por EV: fica o melhor de cada ativo
+            mostrar = base.head(int(n_picks))
             colunas = st.columns(2)
             for i, (_, o) in enumerate(mostrar.iterrows()):
                 with colunas[i % 2]:
@@ -968,7 +982,7 @@ with aba_hot:
         with st.expander("Como os hot picks são escolhidos"):
             st.markdown(
                 "1. **Universo**: pozinhos da aba ao lado, só os negociáveis (bid, negócio no pregão, spread "
-                "aceitável), sem semanais e alinhados ao HiLo, se marcado.\n"
+                "aceitável), sem semanais e alinhados ao HiLo, se marcado. Ativos em 'Excluir ativos' ficam de fora.\n"
                 "2. **Simulação da sua regra**: para cada janela histórica com o mesmo prazo da opção, o ativo "
                 "refaz o caminho daquele período a partir do preço de hoje, e a opção é reavaliada todo dia "
                 "(Black-Scholes, vol = média entre a implícita e a EWMA do ativo). Se ela chega a valer o prêmio + "
