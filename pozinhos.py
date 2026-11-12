@@ -50,6 +50,7 @@ MIN_JANELAS = 100    # abaixo disso as probabilidades empíricas não são mostr
 FAIXAS = {"Até R$ 0,05": (0.0, 0.05), "R$ 0,06 a 0,10": (0.055, 0.10), "R$ 0,11 a 0,15": (0.105, 0.15)}
 ALVOS_SAIDA = (0.3, 0.5, 0.6, 0.8, 1.0, 2.0)   # ganho sobre o prêmio em que a operação é zerada
 ALVO_PADRAO = 0.8
+VERSAO_CALCULO = "2026-11-12"          # mude ao alterar o cálculo: invalida o cache do app
 TETO_IV = 3.0                        # implícita acima de 3× a EWMA é tratada como 3× (ruído de pozinho)
 SPREAD_TETO = 1.9                    # spread relativo máximo usado no desconto do bid (2 = bid zero)
 
@@ -296,9 +297,9 @@ def alta_prob(poz: pd.DataFrame, alvo: float = ALVO_ALTA_PROB, prob_min: float =
     Ordena pela chance líquida e desempata pelo EV líquido. Com `ev_positivo`, descarta os
     que têm chance alta mas EV negativo (ganha pouco muitas vezes e perde tudo nas outras,
     acima do que compensa)."""
-    if poz.empty:
-        return poz
     pr, ev = col_prob_liq(alvo), col_ev_liq(alvo)
+    if poz.empty or pr not in poz.columns or ev not in poz.columns:
+        return poz.iloc[0:0]
     f = (poz["tipo"].isin(tipos) & (poz["du"] <= du_max) & poz["bid"].notna() & (poz["negocios"] > 0)
          & (poz["spread"] <= spread_max) & poz[pr].notna() & (poz[pr] >= prob_min))
     if ev_positivo:

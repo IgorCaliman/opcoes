@@ -702,7 +702,9 @@ with aba_cadeia:
 
 # ---- Pozinhos -------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner="Calculando pozinhos (simulando a regra de saída no histórico)...")
-def _listar_pozinhos(hoje: date, versao: str, selic: float) -> tuple[date | None, pd.DataFrame]:
+def _listar_pozinhos(hoje: date, versao: str, selic: float,
+                     versao_calc: str = pz.VERSAO_CALCULO) -> tuple[date | None, pd.DataFrame]:
+    # versao_calc entra na chave do cache: mudou o cálculo em pozinhos.py, a lista é refeita.
     resultado = pregao_opcoes(hoje)
     if resultado is None:
         return None, pd.DataFrame()
@@ -790,7 +792,7 @@ with aba_pozinhos:
         "nos ativos da lista principal e do acompanhamento. Dados de fim de dia do COTAHIST da B3. "
         "Colunas 'hist.' vêm do histórico ajustado do próprio ativo, em janelas com o mesmo prazo da opção."
     )
-    pregao_poz, poz = _listar_pozinhos(date.today(), VERSAO, selic_atual())
+    pregao_poz, poz = _listar_pozinhos(date.today(), VERSAO, selic_atual(), pz.VERSAO_CALCULO)
     if pregao_poz is None:
         st.error("Não foi possível baixar o COTAHIST da B3 nos últimos pregões. Tente de novo mais tarde.")
     elif poz.empty:
@@ -918,7 +920,7 @@ with aba_hot:
         "pelo histórico do próprio ativo. Só entram opções negociáveis: com bid, com negócio no pregão, spread de "
         f"até {pz.SPREAD_MAX * 100:.0f}% do meio e pelo menos {pz.PROB_MIN * 100:.0f}% de chance de bater o alvo."
     )
-    pregao_hot, poz_hot = _listar_pozinhos(date.today(), VERSAO, selic_atual())
+    pregao_hot, poz_hot = _listar_pozinhos(date.today(), VERSAO, selic_atual(), pz.VERSAO_CALCULO)
     if pregao_hot is None:
         st.error("Não foi possível baixar o COTAHIST da B3 nos últimos pregões. Tente de novo mais tarde.")
     elif poz_hot.empty:
@@ -1039,7 +1041,7 @@ with aba_alta:
         "venda antes do vencimento sai no bid estimado (valor teórico menos meio spread), e a compra no ask. "
         "Ordenados pela chance de bater o alvo; o EV líquido desempata e, por padrão, precisa ser positivo."
     )
-    pregao_alta, poz_alta = _listar_pozinhos(date.today(), VERSAO, selic_atual())
+    pregao_alta, poz_alta = _listar_pozinhos(date.today(), VERSAO, selic_atual(), pz.VERSAO_CALCULO)
     if pregao_alta is None:
         st.error("Não foi possível baixar o COTAHIST da B3 nos últimos pregões. Tente de novo mais tarde.")
     elif poz_alta.empty:
