@@ -364,10 +364,10 @@ with st.sidebar:
         st.warning("Sem dados: " + ", ".join(SEM_DADOS))
 
 (aba_ativo, aba_consolidado, aba_operacoes, aba_mercado, aba_watch,
- aba_direcional, aba_travas, aba_cadeia, aba_pozinhos, aba_hot) = st.tabs([
+ aba_direcional, aba_travas, aba_cadeia, aba_pozinhos, aba_hot, aba_alta) = st.tabs([
     "Ativo por ativo", "Consolidado", "Operações abertas", "Mercado e exposição", "Acompanhamento",
     "Acompanhamento - direcional", "Acompanhamento - travas", "Cadeia de opções", "Pozinhos",
-    "Pozinhos - hot picks",
+    "Pozinhos - hot picks", "Pozinhos - alta prob. lucro",
 ])
 
 with aba_ativo:
@@ -724,7 +724,8 @@ def cor_sigma(v: float) -> str:
 
 
 def cor_nota(v: str) -> str:
-    return {"Quente": VERDE, "Morno": AMARELO, "Frio": VERMELHO}.get(v, "")
+    return {"Quente": VERDE, "Morno": AMARELO, "Frio": VERMELHO, "Muito alta": VERDE, "Alta": VERDE,
+            "Moderada": AMARELO, "Sem vantagem": VERMELHO}.get(v, "")
 
 
 def pct_txt(v: float, casas: int = 0, sinal: bool = False) -> str:
@@ -754,6 +755,8 @@ COLS_POZ_EXTRA = {
 ORDENS_POZ = {
     "EV com saída em +80%": (EV80, False), "Chance de bater +80%": (PR80, False),
     "Retorno no vencimento (hist.)": ("ret_esperado", False), "Mult. em 2σ": ("mult_2s", False),
+    "Chance líquida de +30% (venda no bid)": (pz.col_prob_liq(0.3), False),
+    "Chance líquida de +50% (venda no bid)": (pz.col_prob_liq(0.5), False),
     "Menos σ até o breakeven": ("sigma_be", True), "Mais negociados": ("negocios", False),
 }
 FORMATOS_POZ = {
@@ -993,6 +996,130 @@ with aba_hot:
                 "O histórico é de ~3 anos, as janelas se sobrepõem e a saída é avaliada no fechamento sem custo de "
                 "spread. Um EV de +10% no histórico não é garantia de nada: é o melhor ponto de partida para a "
                 "sua análise, não o fim dela."
+            )
+
+
+# ---- Pozinhos - alta prob. lucro ----------------------------------------------------------
+COR_NOTA_PROB = {"Muito alta": "#00c853", "Alta": "#9ccc65", "Moderada": "#facc15", "Sem vantagem": "#ff1744"}
+
+
+def card_alta(o: pd.Series, alvo: float) -> None:
+    with st.container(border=True):
+        cor = COR_HILO_ALTA if o["tipo"] == "Call" else COR_HILO_BAIXA
+        nota_cor = COR_NOTA_PROB.get(o["nota"], "#9e9e9e")
+        st.markdown(
+            f"<div style='display:flex;justify-content:space-between;align-items:center'>"
+            f"<span style='font-size:1.15rem;font-weight:700'>{o['opcao']}</span>"
+            f"<span style='background:{nota_cor};color:#000;padding:2px 8px;border-radius:6px;"
+            f"font-weight:600;font-size:0.8rem'>Chance {o['nota'].lower()}</span></div>"
+            f"<div style='color:{cor};font-weight:600'>{o['ativo']} · {o['tipo']}</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            f"Strike {num_txt(o['strike'])} · venc. {o['vencimento']:%d/%m} ({o['du']} d.u.) · "
+            f"compra R\\$ {num_txt(o['premio'])} (bid {num_txt(o['bid'])}, spread {pct_txt(o['spread'])}) · "
+            f"{o['negocios']} negócios"
+        )
+        alvo_preco = o["premio"] * (1 + alvo)
+        k1, k2, k3 = st.columns(3)
+        k1.metric(f"Chance de +{alvo * 100:.0f}% líq.", pct_txt(o["prob_alvo"]),
+                  f"bruta {pct_txt(o['prob_bruta'])}", delta_color="off")
+        k2.metric("EV líquido", pct_txt(o["ev"], 0, True))
+        k3.metric("Vender a", f"R$ {num_txt(alvo_preco)}")
+        st.caption(
+            f"Deixe a venda a R\\$ {num_txt(alvo_preco)} (+{alvo * 100:.0f}% sobre o pago). "
+            f"σ até breakeven {num_txt(o['sigma_be'], 1)}σ · HiLo {'a favor' if o['alinhado'] else 'contra'} · "
+            f"mercado {o['mercado'].lower()}."
+        )
+
+
+with aba_alta:
+    st.caption(
+        "Pozinhos com maior chance de dar lucro, mesmo que menor. A chance é líquida: na simulação histórica a "
+        "venda antes do vencimento sai no bid estimado (valor teórico menos meio spread), e a compra no ask. "
+        "Ordenados pela chance de bater o alvo; o EV líquido desempata e, por padrão, precisa ser positivo."
+    )
+    pregao_alta, poz_alta = _listar_pozinhos(date.today(), VERSAO, selic_atual())
+    if pregao_alta is None:
+        st.error("Não foi possível baixar o COTAHIST da B3 nos últimos pregões. Tente de novo mais tarde.")
+    elif poz_alta.empty:
+        st.caption("Nenhum pozinho encontrado nos ativos do universo.")
+    else:
+        a1, a2, a3, a4 = st.columns([1, 1, 2, 1])
+        tipos_alta = a1.multiselect("Tipo", ["Call", "Put"], default=["Call", "Put"], key="alta_tipo")
+        alvo_rot_alta = a2.selectbox("Zerar com", list(ALVO_ROTULOS),
+                                     index=list(ALVO_ROTULOS.values()).index(pz.ALVO_ALTA_PROB), key="alta_alvo")
+        du_alta = a3.slider("Prazo máximo (dias úteis)", 1, pz.DU_MAX, 30, key="alta_du")
+        n_alta = a4.number_input("Quantos picks", 2, 20, 6, step=2, key="alta_n")
+        b1, b2 = st.columns(2)
+        prob_min_alta = b1.slider("Chance líquida mínima (%)", 10, 90, int(pz.PROB_MIN_ALTA * 100), step=5,
+                                  key="alta_prob") / 100
+        spread_max_alta = b2.slider("Spread máximo (% do meio)", 10, 100, int(pz.SPREAD_MAX_ALTA * 100), step=5,
+                                    key="alta_spread",
+                                    help="Em alvo baixo, o spread decide: com 50% de spread, vender no bid já "
+                                         "custa ~25% do valor da opção.") / 100
+        c1, c2, c3, c4, c5 = st.columns(5)
+        ev_pos_alta = c1.checkbox("Só EV líquido positivo", value=True, key="alta_ev",
+                                  help="Tira os que acertam muito mas perdem mais do que ganham na média.")
+        sem_sem_alta = c2.checkbox("Sem vencimentos semanais", value=True, key="alta_semanal")
+        alinh_alta = c3.checkbox("Só alinhados com o HiLo", value=True, key="alta_alinhado")
+        merc_alta = c4.checkbox("Excluir os contra o regime", value=False, key="alta_mercado")
+        um_alta = c5.checkbox("Um pick por ativo", value=True, key="alta_um_por_ativo")
+        excluir_alta = st.multiselect("Excluir ativos", sorted(poz_alta["ativo"].unique()), key="alta_excluir",
+                                      placeholder="Ex.: BBAS3")
+        alvo_alta = ALVO_ROTULOS[alvo_rot_alta]
+
+        sel_alta = pz.alta_prob(poz_alta, alvo_alta, prob_min_alta, spread_max_alta, ev_pos_alta, tuple(tipos_alta),
+                                du_alta, sem_sem_alta, alinh_alta, a_favor_regime, merc_alta)
+        if excluir_alta:
+            sel_alta = sel_alta[~sel_alta["ativo"].isin(excluir_alta)].reset_index(drop=True)
+        st.markdown(f"Pregão de **{pregao_alta:%d/%m/%Y}** · regime **{REGIME['rotulo']}** · "
+                    f"{len(sel_alta)} pozinhos com chance líquida de pelo menos {pct_txt(prob_min_alta)} "
+                    f"de bater {alvo_rot_alta}.")
+
+        if sel_alta.empty:
+            st.info("Nenhum pozinho passa nesses filtros. Tente um alvo menor, prazo maior, spread máximo maior "
+                    "ou chance mínima menor.")
+        else:
+            base_alta = sel_alta.drop_duplicates("ativo") if um_alta else sel_alta
+            colunas_alta = st.columns(2)
+            for i, (_, o) in enumerate(base_alta.head(int(n_alta)).iterrows()):
+                with colunas_alta[i % 2]:
+                    card_alta(o, alvo_alta)
+
+            with st.expander(f"Ranking completo ({len(sel_alta)} pozinhos)"):
+                rk = sel_alta.rename(columns={
+                    "nota": "Nota", "opcao": "Opção", "ativo": "Ativo", "tipo": "Tipo", "vencimento": "Venc.",
+                    "du": "d.u.", "strike": "Strike", "premio": "Prêmio", "bid": "Bid", "spread": "Spread",
+                    "negocios": "Negócios", "sigma_be": "σ até breakeven", "prob_alvo": "Chance líquida",
+                    "prob_bruta": "Chance bruta", "ev": "EV líquido", "mercado": "Mercado",
+                })[["Nota", "Opção", "Ativo", "Tipo", "Venc.", "d.u.", "Strike", "Prêmio", "Bid", "Spread",
+                    "Negócios", "σ até breakeven", "Chance líquida", "Chance bruta", "EV líquido", "Mercado"]]
+                st.dataframe(
+                    estilo_pozinhos(rk).format({"Chance líquida": lambda v: pct_txt(v, 1),
+                                                "Chance bruta": lambda v: pct_txt(v, 1),
+                                                "EV líquido": lambda v: pct_txt(v, 0, True)})
+                    .map(cor_retorno, subset=["EV líquido"]),
+                    hide_index=True, width="stretch", height=min(40 + 35 * len(rk), 600),
+                )
+
+        with st.expander("Como a chance é calculada"):
+            st.markdown(
+                "1. **Universo**: pozinhos negociáveis (bid, negócio no pregão, spread até o máximo escolhido).\n"
+                "2. **Simulação**: para cada janela histórica com o mesmo prazo, o ativo refaz o caminho daquele "
+                "período a partir do preço de hoje e a opção é reavaliada todo dia (Black-Scholes, vol = média "
+                "entre a implícita e a EWMA).\n"
+                "3. **Chance líquida**: conta as janelas em que, vendendo no bid estimado (valor − meio spread), a "
+                "opção chegaria ao prêmio pago + alvo antes do vencimento. A chance bruta ignora o spread; a "
+                "diferença entre as duas mostra quanto o spread pesa.\n"
+                "4. **EV líquido**: média de todas as janelas (ganha o alvo onde bate; onde não bate, fica com o "
+                "valor no vencimento, quase sempre zero). Chance de 70% com EV negativo quer dizer que os 30% "
+                "de perda total pesam mais que os ganhos pequenos.\n"
+                "5. **Nota**: Muito alta = chance ≥ 65% com EV positivo; Alta = ≥ 50%; Moderada = EV positivo "
+                "abaixo disso.\n\n"
+                "Alvo menor sobe a chance, mas não faz mágica: o mercado cobra no prêmio. O que interessa são os "
+                "casos em que a chance líquida segue alta *e* o EV é positivo. Limitações: histórico de ~3 anos, "
+                "janelas sobrepostas, saída avaliada no fechamento e spread de hoje suposto constante."
             )
 
 

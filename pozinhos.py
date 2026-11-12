@@ -26,7 +26,13 @@ EWMA do ativo). Se em algum fechamento ela valer prêmio × (1 + alvo), conta co
 a saída é no alvo; senão, fica com o valor no vencimento. Daí saem:
 - Chance de bater o alvo (hist.).
 - EV com saída: retorno médio por real investido seguindo a regra. É o critério dos hot picks.
-A saída é avaliada no fechamento e sem custo de spread na venda: a realidade é um pouco pior.
+
+Versão líquida (base da aba "alta prob. lucro"): a mesma simulação, mas a venda antes do
+vencimento é feita no bid, não no valor teórico. O bid estimado é valor × (1 − spread/2),
+com o spread relativo de hoje ((ask − bid) / meio). Assim, para embolsar +30% sobre o ask
+pago, a opção precisa valer bem mais que +30% no modelo quando o spread é largo. Em alvos
+baixos (+30%, +50%) é isso que separa chance real de chance de planilha. No vencimento o
+valor é o intrínseco (exercício), sem desconto.
 """
 from __future__ import annotations
 
@@ -42,9 +48,10 @@ PRECO_MAX = 0.15     # teto do pozinho (R$)
 DU_MAX = 60          # prazo máximo considerado (dias úteis)
 MIN_JANELAS = 100    # abaixo disso as probabilidades empíricas não são mostradas
 FAIXAS = {"Até R$ 0,05": (0.0, 0.05), "R$ 0,06 a 0,10": (0.055, 0.10), "R$ 0,11 a 0,15": (0.105, 0.15)}
-ALVOS_SAIDA = (0.6, 0.8, 1.0, 2.0)   # ganho sobre o prêmio em que a operação é zerada
+ALVOS_SAIDA = (0.3, 0.5, 0.6, 0.8, 1.0, 2.0)   # ganho sobre o prêmio em que a operação é zerada
 ALVO_PADRAO = 0.8
 TETO_IV = 3.0                        # implícita acima de 3× a EWMA é tratada como 3× (ruído de pozinho)
+SPREAD_TETO = 1.9                    # spread relativo máximo usado no desconto do bid (2 = bid zero)
 
 
 def col_prob(alvo: float) -> str:
@@ -53,6 +60,18 @@ def col_prob(alvo: float) -> str:
 
 def col_ev(alvo: float) -> str:
     return f"ev_saida_{int(round(alvo * 100))}"
+
+
+def col_prob_liq(alvo: float) -> str:
+    return f"prob_liq_{int(round(alvo * 100))}"
+
+
+def col_ev_liq(alvo: float) -> str:
+    return f"ev_liq_{int(round(alvo * 100))}"
+
+
+def colunas_saida() -> list[str]:
+    return [c for a in ALVOS_SAIDA for c in (col_prob(a), col_ev(a), col_prob_liq(a), col_ev_liq(a))]
 
 
 # ---- Histórico do ativo ------------------------------------------------------------
@@ -84,9 +103,12 @@ def caminhos(hist: pd.DataFrame, du: int) -> np.ndarray | None:
 
 
 def metricas_saida(rel: np.ndarray | None, spot: float, strike: float, premio: float, tipo: str,
-                   vol: float | None, r: float, du: int) -> dict:
-    """Chance de bater cada alvo e EV seguindo a regra de saída, no caminho histórico."""
-    vazio = {k: np.nan for a in ALVOS_SAIDA for k in (col_prob(a), col_ev(a))}
+                   vol: float | None, r: float, du: int, spread: float | None = None) -> dict:
+    """Chance de bater cada alvo e EV seguindo a regra de saída, no caminho histórico.
+
+    Bruta: saída no valor teórico. Líquida: saída antes do vencimento no bid estimado,
+    valor × (1 − spread/2); no último pregão vale o intrínseco."""
+    vazio = {k: np.nan for k in colunas_saida()}
     if rel is None or not vol or premio <= 0:
         return vazio
     S = spot * rel
@@ -94,11 +116,27 @@ def metricas_saida(rel: np.ndarray | None, spot: float, strike: float, premio: f
     valor = bs.preco(S, strike, np.broadcast_to(T, S.shape), r, vol, tipo)
     pico = valor.max(axis=1)
     final = valor[:, -1] / premio - 1
+
+    s = spread if (spread is not None and pd.notna(spread) and spread >= 0) else None
+    if s is None:
+        pico_liq = None
+    else:
+        desconto = 1 - min(s, SPREAD_TETO) / 2
+        antes = valor[:, :-1] * desconto if du > 1 else np.zeros((len(valor), 0))
+        pico_liq = np.maximum(antes.max(axis=1) if antes.shape[1] else 0.0, valor[:, -1])
+
     out = {}
     for a in ALVOS_SAIDA:
         bateu = pico >= premio * (1 + a)
         out[col_prob(a)] = float(bateu.mean())
         out[col_ev(a)] = float(np.where(bateu, a, final).mean())
+        if pico_liq is None:
+            out[col_prob_liq(a)] = np.nan
+            out[col_ev_liq(a)] = np.nan
+        else:
+            bateu_liq = pico_liq >= premio * (1 + a)
+            out[col_prob_liq(a)] = float(bateu_liq.mean())
+            out[col_ev_liq(a)] = float(np.where(bateu_liq, a, final).mean())
     return out
 
 
@@ -170,7 +208,9 @@ def listar(cotahist: pd.DataFrame, pregao: date, selic: float, historicos: dict[
             vol_cam = vol
             if vol and pd.notna(o.iv):
                 vol_cam = 0.5 * (min(o.iv, TETO_IV * vol) + vol)
-            saida = metricas_saida(cache_cam[o.du], o.spot, o.strike, o.premio, o.tipo, vol_cam, r, o.du)
+            spread_o = o.spread if pd.notna(o.bid) else None   # sem bid não há como estimar a venda
+            saida = metricas_saida(cache_cam[o.du], o.spot, o.strike, o.premio, o.tipo, vol_cam, r, o.du,
+                                   spread_o)
             linhas.append({
                 "opcao": o.opcao, "ativo": ativo, "tipo": o.tipo, "vencimento": o.vencimento, "du": o.du,
                 "strike": o.strike, "spot": o.spot, "dist": o.dist, "premio": o.premio, "bid": o.bid,
@@ -187,8 +227,7 @@ def listar(cotahist: pd.DataFrame, pregao: date, selic: float, historicos: dict[
     if not linhas:
         return pd.DataFrame()
     df = pd.DataFrame(linhas)
-    hist_cols = ["prob_venc", "prob_toque", "ret_esperado", "razao_prob"] + \
-        [c for a in ALVOS_SAIDA for c in (col_prob(a), col_ev(a))]
+    hist_cols = ["prob_venc", "prob_toque", "ret_esperado", "razao_prob"] + colunas_saida()
     df.loc[df["janelas"] < MIN_JANELAS, hist_cols] = np.nan
     return df.sort_values(col_ev(ALVO_PADRAO), ascending=False, na_position="last").reset_index(drop=True)
 
@@ -230,6 +269,55 @@ def hot_picks(poz: pd.DataFrame, alvo: float, tipos=("Call", "Put"), du_max: int
     return out.sort_values("ev", ascending=False).reset_index(drop=True)
 
 
+# ---- Alta probabilidade de lucro ----------------------------------------------------------
+ALVO_ALTA_PROB = 0.3        # alvo padrão da aba: lucro menor, mais provável
+PROB_MIN_ALTA = 0.5         # chance líquida mínima padrão
+SPREAD_MAX_ALTA = 0.5       # spread máximo padrão: em alvo baixo, spread largo come o lucro
+
+
+def classificar_prob(prob: float, ev: float) -> str:
+    if pd.isna(prob):
+        return "—"
+    if prob >= 0.65 and ev > 0:
+        return "Muito alta"
+    if prob >= 0.5 and ev > 0:
+        return "Alta"
+    if ev > 0:
+        return "Moderada"
+    return "Sem vantagem"
+
+
+def alta_prob(poz: pd.DataFrame, alvo: float = ALVO_ALTA_PROB, prob_min: float = PROB_MIN_ALTA,
+              spread_max: float = SPREAD_MAX_ALTA, ev_positivo: bool = True, tipos=("Call", "Put"),
+              du_max: int = 30, sem_semanais: bool = True, so_alinhados: bool = True, mercado_fn=None,
+              so_mercado: bool = False) -> pd.DataFrame:
+    """Pozinhos com maior chance líquida (venda no bid) de bater um alvo de lucro modesto.
+
+    Ordena pela chance líquida e desempata pelo EV líquido. Com `ev_positivo`, descarta os
+    que têm chance alta mas EV negativo (ganha pouco muitas vezes e perde tudo nas outras,
+    acima do que compensa)."""
+    if poz.empty:
+        return poz
+    pr, ev = col_prob_liq(alvo), col_ev_liq(alvo)
+    f = (poz["tipo"].isin(tipos) & (poz["du"] <= du_max) & poz["bid"].notna() & (poz["negocios"] > 0)
+         & (poz["spread"] <= spread_max) & poz[pr].notna() & (poz[pr] >= prob_min))
+    if ev_positivo:
+        f &= poz[ev] > 0
+    if sem_semanais:
+        f &= ~poz["semanal"]
+    if so_alinhados:
+        f &= poz["alinhado"]
+    out = poz[f].copy()
+    if mercado_fn is not None:
+        out["mercado"] = out["tipo"].map(mercado_fn)
+        if so_mercado:
+            out = out[out["mercado"] != "Contra"]
+    out["prob_alvo"], out["ev"] = out[pr], out[ev]
+    out["prob_bruta"] = out[col_prob(alvo)]
+    out["nota"] = [classificar_prob(p, e) for p, e in zip(out["prob_alvo"], out["ev"])]
+    return out.sort_values(["prob_alvo", "ev"], ascending=[False, False]).reset_index(drop=True)
+
+
 def _n(x: float, casas: int = 1) -> str:
     return f"{x:.{casas}f}".replace(".", ",")
 
@@ -256,6 +344,10 @@ def leitura(o: pd.Series) -> str:
     if ev80 is not None and pd.notna(ev80):
         partes.append(f"com a regra de zerar em +{ALVO_PADRAO * 100:.0f}%, bateu o alvo em {_n(p80 * 100)}% das "
                       f"janelas e o EV ficou em {ev80 * 100:+.0f}% por real investido")
+    p30 = o.get(col_prob_liq(ALVO_ALTA_PROB))
+    if p30 is not None and pd.notna(p30):
+        partes.append(f"vendendo no bid, chegou a +{ALVO_ALTA_PROB * 100:.0f}% líquido em {_n(p30 * 100)}% "
+                      "das janelas")
     if pd.isna(o["bid"]):
         partes.append("sem oferta de compra no fechamento: pode ser difícil sair antes do vencimento")
     return ". ".join(p[0].upper() + p[1:] for p in partes) + "."
